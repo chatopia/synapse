@@ -171,7 +171,7 @@ BASE_APPEND_OVERRIDE_RULES = [
             {
                 'kind': 'event_match',
                 'key': 'sender',
-                'pattern': ':irc.sneakyfrog.com',
+                'pattern': '@irc_*',
                 '_id': '_suppress_sneakyfrog',
             }
         ],
