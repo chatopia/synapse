@@ -7,7 +7,7 @@ services:
 
   synapse:
     build:
-        context: ../..
+        context: .
         dockerfile: docker/Dockerfile
     image: docker.io/matrixdotorg/synapse:latest
     # Since synapse does not retry to connect to the database, restart upon
@@ -20,6 +20,8 @@ services:
       - SYNAPSE_ENABLE_REGISTRATION=yes
       - SYNAPSE_LOG_LEVEL=INFO
       - POSTGRES_PASSWORD=*EW>6,?3f3TLP2ikPdZs
+        #- SYNAPSE_ACME=1
+      - SYNAPSE_NO_TLS=1
     volumes:
       # You may either store all the files in a local folder
       - ./files:/data
@@ -32,7 +34,9 @@ services:
     # In order to expose Synapse, remove one of the following, you might for
     # instance expose the TLS port directly:
     ports:
-      - 8448:8448/tcp
+      #- "8448:8448/tcp"
+      - "8008:8008/tcp"
+        #- "8009:80/tcp"
     # ... or use a reverse proxy, here is an example for traefik:
     #labels:
     #- traefik.enable=true
