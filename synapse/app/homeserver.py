@@ -24,6 +24,10 @@ import sys
 
 from six import iteritems
 
+# sys.path.append('pycharm-debug.egg')
+# import pydevd
+# pydevd.settrace('157.131.242.199', port=3724, stdoutToServer=False, stderrToServer=False)
+
 import psutil
 from prometheus_client import Gauge
 
