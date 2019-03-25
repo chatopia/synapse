@@ -1,16 +1,16 @@
-id: 8bbedaa10e31b331294ef79454352d1d19e6efb549e819054693936b6144953e
-hs_token: e982a71b7b5bb053145373855dc52476324d64af64cc49bc62e237cd56e232c9
-as_token: 9ae52264ecb999819a6e50a370dd928532fd7d6dc02d5a824ebb5ba97f38df7c
+id: 5ff15a0c658927a97fca168df1579b3ae84a8fef4c42e4a11705dd7b834511ee
+hs_token: 14273aceb8a144644dd8671b568e9d13da4e8acf8301126874276635051738f8
+as_token: 22e934b5adb4863cbbc3ec44a4a782b07be65f0c175abebbc82c92c2fd2cfd73
 namespaces:
   users:
     - exclusive: true
-      regex: '@irc_.*:chat\.sneakyfrog\.com'
+    regex: '@irc_.*:chat\.sneakyfrog\.com'
   aliases: []
   rooms:
     - exclusive: false
-      regex: '!bnZOLAENpzxeZyrTQG:irc'
+    regex: '!ZnhLipJrEAsELXXQWE:chat.sneakyfrog.com'
 url: 'http://bridge:9999'
-sender_localpart: appservice-irc
+sender_localpart: my_bot
 rate_limited: false
 protocols:
   - irc
