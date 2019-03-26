@@ -4,11 +4,11 @@ as_token: 22e934b5adb4863cbbc3ec44a4a782b07be65f0c175abebbc82c92c2fd2cfd73
 namespaces:
   users:
     - exclusive: true
-    regex: '@irc_.*:chat\.sneakyfrog\.com'
+      regex: '@irc_.*:chat\.sneakyfrog\.com'
   aliases: []
   rooms:
     - exclusive: false
-    regex: '!ZnhLipJrEAsELXXQWE:chat.sneakyfrog.com'
+      regex: '!ZnhLipJrEAsELXXQWE:chat.sneakyfrog.com'
 url: 'http://bridge:9999'
 sender_localpart: my_bot
 rate_limited: false
