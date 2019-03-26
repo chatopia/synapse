@@ -70,9 +70,7 @@ COPY --from=builder /install /usr/local
 COPY ./docker/start.py /start.py
 COPY ./docker/conf /conf
 
-#VOLUME ["/data"]
 RUN mkdir -p /data/appservices
-
 COPY ./docker/conf/irc-bridge-registration.yaml /data/appservices/irc-bridge-registration.yaml
 
 EXPOSE 8008/tcp 8009/tcp 8448/tcp
