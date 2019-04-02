@@ -72,6 +72,7 @@ COPY ./docker/conf /conf
 
 RUN mkdir -p /data/appservices
 COPY ./docker/conf/irc-bridge-registration.yaml /data/appservices/irc-bridge-registration.yaml
+COPY ./docker/conf/test-bootstrap-registration.yaml /data/appservices/test-bootstrap-registration.yaml
 
 EXPOSE 8008/tcp 8009/tcp 8448/tcp
 
