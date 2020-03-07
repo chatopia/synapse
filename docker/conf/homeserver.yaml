@@ -113,8 +113,12 @@ thumbnail_sizes:
   height: 600
   method: scale
 
-url_preview_enabled: False
+url_preview_enabled: True
 max_spider_size: "10M"
+url_preview_ip_range_blacklist:
+  - 127.0.0.1/8
+  - 172.22.0.1/16
+  - 172.17.0.1/16
 
 ## Captcha ##
 
