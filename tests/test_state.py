@@ -18,13 +18,15 @@ from mock import Mock
 from twisted.internet import defer
 
 from synapse.api.auth import Auth
-from synapse.api.constants import EventTypes, Membership, RoomVersions
-from synapse.events import FrozenEvent
+from synapse.api.constants import EventTypes, Membership
+from synapse.api.room_versions import RoomVersions
+from synapse.events import make_event_from_dict
+from synapse.events.snapshot import EventContext
 from synapse.state import StateHandler, StateResolutionHandler
 
 from tests import unittest
 
-from .utils import MockClock
+from .utils import MockClock, default_config
 
 _next_event_id = 1000
 
@@ -64,12 +66,12 @@ def create_event(
 
     d.update(kwargs)
 
-    event = FrozenEvent(d)
+    event = make_event_from_dict(d)
 
     return event
 
 
-class StateGroupStore(object):
+class StateGroupStore:
     def __init__(self):
         self._event_to_state_group = {}
         self._group_to_state = {}
@@ -78,16 +80,16 @@ class StateGroupStore(object):
 
         self._next_group = 1
 
-    def get_state_groups_ids(self, room_id, event_ids):
+    async def get_state_groups_ids(self, room_id, event_ids):
         groups = {}
         for event_id in event_ids:
             group = self._event_to_state_group.get(event_id)
             if group:
                 groups[group] = self._group_to_state[group]
 
-        return defer.succeed(groups)
+        return groups
 
-    def store_state_group(
+    async def store_state_group(
         self, event_id, room_id, prev_group, delta_ids, current_state_ids
     ):
         state_group = self._next_group
@@ -97,14 +99,14 @@ class StateGroupStore(object):
 
         return state_group
 
-    def get_events(self, event_ids, **kwargs):
+    async def get_events(self, event_ids, **kwargs):
         return {
             e_id: self._event_id_to_event[e_id]
             for e_id in event_ids
             if e_id in self._event_id_to_event
         }
 
-    def get_state_group_delta(self, name):
+    async def get_state_group_delta(self, name):
         return (None, None)
 
     def register_events(self, events):
@@ -117,17 +119,17 @@ class StateGroupStore(object):
     def register_event_id_state_group(self, event_id, state_group):
         self._event_to_state_group[event_id] = state_group
 
-    def get_room_version(self, room_id):
-        return RoomVersions.V1
+    async def get_room_version_id(self, room_id):
+        return RoomVersions.V1.identifier
 
 
 class DictObj(dict):
     def __init__(self, **kwargs):
-        super(DictObj, self).__init__(kwargs)
+        super().__init__(kwargs)
         self.__dict__ = self
 
 
-class Graph(object):
+class Graph:
     def __init__(self, nodes, edges):
         events = {}
         clobbered = set(events.keys())
@@ -157,20 +159,25 @@ class Graph(object):
 class StateTestCase(unittest.TestCase):
     def setUp(self):
         self.store = StateGroupStore()
+        storage = Mock(main=self.store, state=self.store)
         hs = Mock(
             spec_set=[
+                "config",
                 "get_datastore",
+                "get_storage",
                 "get_auth",
                 "get_state_handler",
                 "get_clock",
                 "get_state_resolution_handler",
             ]
         )
+        hs.config = default_config("tesths", True)
         hs.get_datastore.return_value = self.store
         hs.get_state_handler.return_value = None
         hs.get_clock.return_value = MockClock()
         hs.get_auth.return_value = Auth(hs)
         hs.get_state_resolution_handler = lambda: StateResolutionHandler(hs)
+        hs.get_storage.return_value = storage
 
         self.state = StateHandler(hs)
         self.event_id = 0
@@ -192,15 +199,23 @@ class StateTestCase(unittest.TestCase):
 
         self.store.register_events(graph.walk())
 
-        context_store = {}
+        context_store = {}  # type: dict[str, EventContext]
 
         for event in graph.walk():
-            context = yield self.state.compute_event_context(event)
+            context = yield defer.ensureDeferred(
+                self.state.compute_event_context(event)
+            )
             self.store.register_event_context(event, context)
             context_store[event.event_id] = context
 
-        prev_state_ids = yield context_store["D"].get_prev_state_ids(self.store)
+        ctx_c = context_store["C"]
+        ctx_d = context_store["D"]
+
+        prev_state_ids = yield defer.ensureDeferred(ctx_d.get_prev_state_ids())
         self.assertEqual(2, len(prev_state_ids))
+
+        self.assertEqual(ctx_c.state_group, ctx_d.state_group_before_event)
+        self.assertEqual(ctx_d.state_group_before_event, ctx_d.state_group)
 
     @defer.inlineCallbacks
     def test_branch_basic_conflict(self):
@@ -231,15 +246,22 @@ class StateTestCase(unittest.TestCase):
         context_store = {}
 
         for event in graph.walk():
-            context = yield self.state.compute_event_context(event)
+            context = yield defer.ensureDeferred(
+                self.state.compute_event_context(event)
+            )
             self.store.register_event_context(event, context)
             context_store[event.event_id] = context
 
-        prev_state_ids = yield context_store["D"].get_prev_state_ids(self.store)
+        # C ends up winning the resolution between B and C
 
-        self.assertSetEqual(
-            {"START", "A", "C"}, {e_id for e_id in prev_state_ids.values()}
-        )
+        ctx_c = context_store["C"]
+        ctx_d = context_store["D"]
+
+        prev_state_ids = yield defer.ensureDeferred(ctx_d.get_prev_state_ids())
+        self.assertSetEqual({"START", "A", "C"}, set(prev_state_ids.values()))
+
+        self.assertEqual(ctx_c.state_group, ctx_d.state_group_before_event)
+        self.assertEqual(ctx_d.state_group_before_event, ctx_d.state_group)
 
     @defer.inlineCallbacks
     def test_branch_have_banned_conflict(self):
@@ -282,15 +304,22 @@ class StateTestCase(unittest.TestCase):
         context_store = {}
 
         for event in graph.walk():
-            context = yield self.state.compute_event_context(event)
+            context = yield defer.ensureDeferred(
+                self.state.compute_event_context(event)
+            )
             self.store.register_event_context(event, context)
             context_store[event.event_id] = context
 
-        prev_state_ids = yield context_store["E"].get_prev_state_ids(self.store)
+        # C ends up winning the resolution between C and D because bans win over other
+        # changes
 
-        self.assertSetEqual(
-            {"START", "A", "B", "C"}, {e for e in prev_state_ids.values()}
-        )
+        ctx_c = context_store["C"]
+        ctx_e = context_store["E"]
+
+        prev_state_ids = yield defer.ensureDeferred(ctx_e.get_prev_state_ids())
+        self.assertSetEqual({"START", "A", "B", "C"}, set(prev_state_ids.values()))
+        self.assertEqual(ctx_c.state_group, ctx_e.state_group_before_event)
+        self.assertEqual(ctx_e.state_group_before_event, ctx_e.state_group)
 
     @defer.inlineCallbacks
     def test_branch_have_perms_conflict(self):
@@ -350,24 +379,32 @@ class StateTestCase(unittest.TestCase):
         context_store = {}
 
         for event in graph.walk():
-            context = yield self.state.compute_event_context(event)
+            context = yield defer.ensureDeferred(
+                self.state.compute_event_context(event)
+            )
             self.store.register_event_context(event, context)
             context_store[event.event_id] = context
 
-        prev_state_ids = yield context_store["D"].get_prev_state_ids(self.store)
+        # B ends up winning the resolution between B and C because power levels
+        # win over other changes.
 
-        self.assertSetEqual(
-            {"A1", "A2", "A3", "A5", "B"}, {e for e in prev_state_ids.values()}
-        )
+        ctx_b = context_store["B"]
+        ctx_d = context_store["D"]
+
+        prev_state_ids = yield defer.ensureDeferred(ctx_d.get_prev_state_ids())
+        self.assertSetEqual({"A1", "A2", "A3", "A5", "B"}, set(prev_state_ids.values()))
+
+        self.assertEqual(ctx_b.state_group, ctx_d.state_group_before_event)
+        self.assertEqual(ctx_d.state_group_before_event, ctx_d.state_group)
 
     def _add_depths(self, nodes, edges):
         def _get_depth(ev):
             node = nodes[ev]
-            if 'depth' not in node:
+            if "depth" not in node:
                 prevs = edges[ev]
                 depth = max(_get_depth(prev) for prev in prevs) + 1
-                node['depth'] = depth
-            return node['depth']
+                node["depth"] = depth
+            return node["depth"]
 
         for n in nodes:
             _get_depth(n)
@@ -382,15 +419,20 @@ class StateTestCase(unittest.TestCase):
             create_event(type="test2", state_key=""),
         ]
 
-        context = yield self.state.compute_event_context(event, old_state=old_state)
-
-        current_state_ids = yield context.get_current_state_ids(self.store)
-
-        self.assertEqual(
-            set(e.event_id for e in old_state), set(current_state_ids.values())
+        context = yield defer.ensureDeferred(
+            self.state.compute_event_context(event, old_state=old_state)
         )
 
-        self.assertIsNotNone(context.state_group)
+        prev_state_ids = yield defer.ensureDeferred(context.get_prev_state_ids())
+        self.assertCountEqual((e.event_id for e in old_state), prev_state_ids.values())
+
+        current_state_ids = yield defer.ensureDeferred(context.get_current_state_ids())
+        self.assertCountEqual(
+            (e.event_id for e in old_state), current_state_ids.values()
+        )
+
+        self.assertIsNotNone(context.state_group_before_event)
+        self.assertEqual(context.state_group_before_event, context.state_group)
 
     @defer.inlineCallbacks
     def test_annotate_with_old_state(self):
@@ -402,13 +444,22 @@ class StateTestCase(unittest.TestCase):
             create_event(type="test2", state_key=""),
         ]
 
-        context = yield self.state.compute_event_context(event, old_state=old_state)
-
-        prev_state_ids = yield context.get_prev_state_ids(self.store)
-
-        self.assertEqual(
-            set(e.event_id for e in old_state), set(prev_state_ids.values())
+        context = yield defer.ensureDeferred(
+            self.state.compute_event_context(event, old_state=old_state)
         )
+
+        prev_state_ids = yield defer.ensureDeferred(context.get_prev_state_ids())
+        self.assertCountEqual((e.event_id for e in old_state), prev_state_ids.values())
+
+        current_state_ids = yield defer.ensureDeferred(context.get_current_state_ids())
+        self.assertCountEqual(
+            (e.event_id for e in old_state + [event]), current_state_ids.values()
+        )
+
+        self.assertIsNotNone(context.state_group_before_event)
+        self.assertNotEqual(context.state_group_before_event, context.state_group)
+        self.assertEqual(context.state_group_before_event, context.prev_group)
+        self.assertEqual({("state", ""): event.event_id}, context.delta_ids)
 
     @defer.inlineCallbacks
     def test_trivial_annotate_message(self):
@@ -423,21 +474,23 @@ class StateTestCase(unittest.TestCase):
             create_event(type="test2", state_key=""),
         ]
 
-        group_name = self.store.store_state_group(
-            prev_event_id,
-            event.room_id,
-            None,
-            None,
-            {(e.type, e.state_key): e.event_id for e in old_state},
+        group_name = yield defer.ensureDeferred(
+            self.store.store_state_group(
+                prev_event_id,
+                event.room_id,
+                None,
+                None,
+                {(e.type, e.state_key): e.event_id for e in old_state},
+            )
         )
         self.store.register_event_id_state_group(prev_event_id, group_name)
 
-        context = yield self.state.compute_event_context(event)
+        context = yield defer.ensureDeferred(self.state.compute_event_context(event))
 
-        current_state_ids = yield context.get_current_state_ids(self.store)
+        current_state_ids = yield defer.ensureDeferred(context.get_current_state_ids())
 
         self.assertEqual(
-            set([e.event_id for e in old_state]), set(current_state_ids.values())
+            {e.event_id for e in old_state}, set(current_state_ids.values())
         )
 
         self.assertEqual(group_name, context.state_group)
@@ -455,22 +508,22 @@ class StateTestCase(unittest.TestCase):
             create_event(type="test2", state_key=""),
         ]
 
-        group_name = self.store.store_state_group(
-            prev_event_id,
-            event.room_id,
-            None,
-            None,
-            {(e.type, e.state_key): e.event_id for e in old_state},
+        group_name = yield defer.ensureDeferred(
+            self.store.store_state_group(
+                prev_event_id,
+                event.room_id,
+                None,
+                None,
+                {(e.type, e.state_key): e.event_id for e in old_state},
+            )
         )
         self.store.register_event_id_state_group(prev_event_id, group_name)
 
-        context = yield self.state.compute_event_context(event)
+        context = yield defer.ensureDeferred(self.state.compute_event_context(event))
 
-        prev_state_ids = yield context.get_prev_state_ids(self.store)
+        prev_state_ids = yield defer.ensureDeferred(context.get_prev_state_ids())
 
-        self.assertEqual(
-            set([e.event_id for e in old_state]), set(prev_state_ids.values())
-        )
+        self.assertEqual({e.event_id for e in old_state}, set(prev_state_ids.values()))
 
         self.assertIsNotNone(context.state_group)
 
@@ -507,7 +560,7 @@ class StateTestCase(unittest.TestCase):
             event, prev_event_id1, old_state_1, prev_event_id2, old_state_2
         )
 
-        current_state_ids = yield context.get_current_state_ids(self.store)
+        current_state_ids = yield defer.ensureDeferred(context.get_current_state_ids())
 
         self.assertEqual(len(current_state_ids), 6)
 
@@ -549,7 +602,7 @@ class StateTestCase(unittest.TestCase):
             event, prev_event_id1, old_state_1, prev_event_id2, old_state_2
         )
 
-        current_state_ids = yield context.get_current_state_ids(self.store)
+        current_state_ids = yield defer.ensureDeferred(context.get_current_state_ids())
 
         self.assertEqual(len(current_state_ids), 6)
 
@@ -604,7 +657,7 @@ class StateTestCase(unittest.TestCase):
             event, prev_event_id1, old_state_1, prev_event_id2, old_state_2
         )
 
-        current_state_ids = yield context.get_current_state_ids(self.store)
+        current_state_ids = yield defer.ensureDeferred(context.get_current_state_ids())
 
         self.assertEqual(old_state_2[3].event_id, current_state_ids[("test1", "1")])
 
@@ -632,29 +685,35 @@ class StateTestCase(unittest.TestCase):
             event, prev_event_id1, old_state_1, prev_event_id2, old_state_2
         )
 
-        current_state_ids = yield context.get_current_state_ids(self.store)
+        current_state_ids = yield defer.ensureDeferred(context.get_current_state_ids())
 
         self.assertEqual(old_state_1[3].event_id, current_state_ids[("test1", "1")])
 
+    @defer.inlineCallbacks
     def _get_context(
         self, event, prev_event_id_1, old_state_1, prev_event_id_2, old_state_2
     ):
-        sg1 = self.store.store_state_group(
-            prev_event_id_1,
-            event.room_id,
-            None,
-            None,
-            {(e.type, e.state_key): e.event_id for e in old_state_1},
+        sg1 = yield defer.ensureDeferred(
+            self.store.store_state_group(
+                prev_event_id_1,
+                event.room_id,
+                None,
+                None,
+                {(e.type, e.state_key): e.event_id for e in old_state_1},
+            )
         )
         self.store.register_event_id_state_group(prev_event_id_1, sg1)
 
-        sg2 = self.store.store_state_group(
-            prev_event_id_2,
-            event.room_id,
-            None,
-            None,
-            {(e.type, e.state_key): e.event_id for e in old_state_2},
+        sg2 = yield defer.ensureDeferred(
+            self.store.store_state_group(
+                prev_event_id_2,
+                event.room_id,
+                None,
+                None,
+                {(e.type, e.state_key): e.event_id for e in old_state_2},
+            )
         )
         self.store.register_event_id_state_group(prev_event_id_2, sg2)
 
-        return self.state.compute_event_context(event)
+        result = yield defer.ensureDeferred(self.state.compute_event_context(event))
+        return result

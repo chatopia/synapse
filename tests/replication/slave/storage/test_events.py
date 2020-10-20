@@ -11,20 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 
 from canonicaljson import encode_canonical_json
 
-from synapse.events import FrozenEvent, _EventInternalMetadata
-from synapse.events.snapshot import EventContext
+from synapse.api.room_versions import RoomVersions
+from synapse.events import FrozenEvent, _EventInternalMetadata, make_event_from_dict
+from synapse.handlers.room import RoomEventSource
 from synapse.replication.slave.storage.events import SlavedEventStore
 from synapse.storage.roommember import RoomsForUser
+from synapse.types import PersistedEventPosition
+
+from tests.server import FakeTransport
 
 from ._base import BaseSlavedStoreTestCase
 
-USER_ID = "@feeling:blue"
-USER_ID_2 = "@bright:blue"
+USER_ID = "@feeling:test"
+USER_ID_2 = "@bright:test"
 OUTLIER = {"outlier": True}
-ROOM_ID = "!room:blue"
+ROOM_ID = "!room:test"
+
+logger = logging.getLogger(__name__)
 
 
 def dict_equals(self, other):
@@ -52,7 +59,16 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         # Patch up the equality operator for events so that we can check
         # whether lists of events match using assertEquals
         self.unpatches = [patch__eq__(_EventInternalMetadata), patch__eq__(FrozenEvent)]
-        return super(SlavedEventStoreTestCase, self).setUp()
+        return super().setUp()
+
+    def prepare(self, *args, **kwargs):
+        super().prepare(*args, **kwargs)
+
+        self.get_success(
+            self.master_store.store_room(
+                ROOM_ID, USER_ID, is_public=False, room_version=RoomVersions.V1,
+            )
+        )
 
     def tearDown(self):
         [unpatch() for unpatch in self.unpatches]
@@ -86,7 +102,9 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         msg_dict["content"] = {}
         msg_dict["unsigned"]["redacted_by"] = redaction.event_id
         msg_dict["unsigned"]["redacted_because"] = redaction
-        redacted = FrozenEvent(msg_dict, msg.internal_metadata.get_dict())
+        redacted = make_event_from_dict(
+            msg_dict, internal_metadata_dict=msg.internal_metadata.get_dict()
+        )
         self.check("get_event", [msg.event_id], redacted)
 
     def test_backfilled_redactions(self):
@@ -106,18 +124,20 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         msg_dict["content"] = {}
         msg_dict["unsigned"]["redacted_by"] = redaction.event_id
         msg_dict["unsigned"]["redacted_because"] = redaction
-        redacted = FrozenEvent(msg_dict, msg.internal_metadata.get_dict())
+        redacted = make_event_from_dict(
+            msg_dict, internal_metadata_dict=msg.internal_metadata.get_dict()
+        )
         self.check("get_event", [msg.event_id], redacted)
 
     def test_invites(self):
         self.persist(type="m.room.create", key="", creator=USER_ID)
-        self.check("get_invited_rooms_for_user", [USER_ID_2], [])
+        self.check("get_invited_rooms_for_local_user", [USER_ID_2], [])
         event = self.persist(type="m.room.member", key=USER_ID_2, membership="invite")
 
         self.replicate()
 
         self.check(
-            "get_invited_rooms_for_user",
+            "get_invited_rooms_for_local_user",
             [USER_ID_2],
             [
                 RoomsForUser(
@@ -141,7 +161,7 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         self.check(
             "get_unread_event_push_actions_by_room_for_user",
             [ROOM_ID, USER_ID_2, event1.event_id],
-            {"highlight_count": 0, "notify_count": 0},
+            {"highlight_count": 0, "unread_count": 0, "notify_count": 0},
         )
 
         self.persist(
@@ -154,7 +174,7 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         self.check(
             "get_unread_event_push_actions_by_room_for_user",
             [ROOM_ID, USER_ID_2, event1.event_id],
-            {"highlight_count": 0, "notify_count": 1},
+            {"highlight_count": 0, "unread_count": 0, "notify_count": 1},
         )
 
         self.persist(
@@ -169,21 +189,147 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         self.check(
             "get_unread_event_push_actions_by_room_for_user",
             [ROOM_ID, USER_ID_2, event1.event_id],
-            {"highlight_count": 1, "notify_count": 2},
+            {"highlight_count": 1, "unread_count": 0, "notify_count": 2},
         )
+
+    def test_get_rooms_for_user_with_stream_ordering(self):
+        """Check that the cache on get_rooms_for_user_with_stream_ordering is invalidated
+        by rows in the events stream
+        """
+        self.persist(type="m.room.create", key="", creator=USER_ID)
+        self.persist(type="m.room.member", key=USER_ID, membership="join")
+        self.replicate()
+        self.check("get_rooms_for_user_with_stream_ordering", (USER_ID_2,), set())
+
+        j2 = self.persist(
+            type="m.room.member", sender=USER_ID_2, key=USER_ID_2, membership="join"
+        )
+        self.replicate()
+
+        expected_pos = PersistedEventPosition(
+            "master", j2.internal_metadata.stream_ordering
+        )
+        self.check(
+            "get_rooms_for_user_with_stream_ordering",
+            (USER_ID_2,),
+            {(ROOM_ID, expected_pos)},
+        )
+
+    def test_get_rooms_for_user_with_stream_ordering_with_multi_event_persist(self):
+        """Check that current_state invalidation happens correctly with multiple events
+        in the persistence batch.
+
+        This test attempts to reproduce a race condition between the event persistence
+        loop and a worker-based Sync handler.
+
+        The problem occurred when the master persisted several events in one batch. It
+        only updates the current_state at the end of each batch, so the obvious thing
+        to do is then to issue a current_state_delta stream update corresponding to the
+        last stream_id in the batch.
+
+        However, that raises the possibility that a worker will see the replication
+        notification for a join event before the current_state caches are invalidated.
+
+        The test involves:
+         * creating a join and a message event for a user, and persisting them in the
+           same batch
+
+         * controlling the replication stream so that updates are sent gradually
+
+         * between each bunch of replication updates, check that we see a consistent
+           snapshot of the state.
+        """
+        self.persist(type="m.room.create", key="", creator=USER_ID)
+        self.persist(type="m.room.member", key=USER_ID, membership="join")
+        self.replicate()
+        self.check("get_rooms_for_user_with_stream_ordering", (USER_ID_2,), set())
+
+        # limit the replication rate
+        repl_transport = self._server_transport
+        assert isinstance(repl_transport, FakeTransport)
+        repl_transport.autoflush = False
+
+        # build the join and message events and persist them in the same batch.
+        logger.info("----- build test events ------")
+        j2, j2ctx = self.build_event(
+            type="m.room.member", sender=USER_ID_2, key=USER_ID_2, membership="join"
+        )
+        msg, msgctx = self.build_event()
+        self.get_success(
+            self.storage.persistence.persist_events([(j2, j2ctx), (msg, msgctx)])
+        )
+        self.replicate()
+
+        event_source = RoomEventSource(self.hs)
+        event_source.store = self.slaved_store
+        current_token = self.get_success(event_source.get_current_key())
+
+        # gradually stream out the replication
+        while repl_transport.buffer:
+            logger.info("------ flush ------")
+            repl_transport.flush(30)
+            self.pump(0)
+
+            prev_token = current_token
+            current_token = self.get_success(event_source.get_current_key())
+
+            # attempt to replicate the behaviour of the sync handler.
+            #
+            # First, we get a list of the rooms we are joined to
+            joined_rooms = self.get_success(
+                self.slaved_store.get_rooms_for_user_with_stream_ordering(USER_ID_2)
+            )
+
+            # Then, we get a list of the events since the last sync
+            membership_changes = self.get_success(
+                self.slaved_store.get_membership_changes_for_user(
+                    USER_ID_2, prev_token, current_token
+                )
+            )
+
+            logger.info(
+                "%s->%s: joined_rooms=%r membership_changes=%r",
+                prev_token,
+                current_token,
+                joined_rooms,
+                membership_changes,
+            )
+
+            # the membership change is only any use to us if the room is in the
+            # joined_rooms list.
+            if membership_changes:
+                expected_pos = PersistedEventPosition(
+                    "master", j2.internal_metadata.stream_ordering
+                )
+                self.assertEqual(joined_rooms, {(ROOM_ID, expected_pos)})
 
     event_id = 0
 
-    def persist(
+    def persist(self, backfill=False, **kwargs):
+        """
+        Returns:
+            synapse.events.FrozenEvent: The event that was persisted.
+        """
+        event, context = self.build_event(**kwargs)
+
+        if backfill:
+            self.get_success(
+                self.storage.persistence.persist_events(
+                    [(event, context)], backfilled=True
+                )
+            )
+        else:
+            self.get_success(self.storage.persistence.persist_event(event, context))
+
+        return event
+
+    def build_event(
         self,
         sender=USER_ID,
         room_id=ROOM_ID,
-        type={},
+        type="m.room.message",
         key=None,
         internal={},
-        state=None,
-        reset_state=False,
-        backfill=False,
         depth=None,
         prev_events=[],
         auth_events=[],
@@ -192,10 +338,7 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         push_actions=[],
         **content
     ):
-        """
-        Returns:
-            synapse.events.FrozenEvent: The event that was persisted.
-        """
+
         if depth is None:
             depth = self.event_id
 
@@ -223,34 +366,17 @@ class SlavedEventStoreTestCase(BaseSlavedStoreTestCase):
         if redacts is not None:
             event_dict["redacts"] = redacts
 
-        event = FrozenEvent(event_dict, internal_metadata_dict=internal)
+        event = make_event_from_dict(event_dict, internal_metadata_dict=internal)
 
         self.event_id += 1
+        state_handler = self.hs.get_state_handler()
+        context = self.get_success(state_handler.compute_event_context(event))
 
-        if state is not None:
-            state_ids = {key: e.event_id for key, e in state.items()}
-            context = EventContext.with_state(
-                state_group=None, current_state_ids=state_ids, prev_state_ids=state_ids
+        self.get_success(
+            self.master_store.add_push_actions_to_staging(
+                event.event_id,
+                {user_id: actions for user_id, actions in push_actions},
+                False,
             )
-        else:
-            state_handler = self.hs.get_state_handler()
-            context = self.get_success(state_handler.compute_event_context(event))
-
-        self.master_store.add_push_actions_to_staging(
-            event.event_id, {user_id: actions for user_id, actions in push_actions}
         )
-
-        ordering = None
-        if backfill:
-            self.get_success(
-                self.master_store.persist_events([(event, context)], backfilled=True)
-            )
-        else:
-            ordering, _ = self.get_success(
-                self.master_store.persist_event(event, context)
-            )
-
-        if ordering:
-            event.internal_metadata.stream_ordering = ordering
-
-        return event
+        return event, context

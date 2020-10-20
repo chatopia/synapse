@@ -15,13 +15,16 @@
 
 import logging
 from functools import wraps
+from typing import Any, Callable, Optional, TypeVar, cast
 
 from prometheus_client import Counter
 
-from twisted.internet import defer
-
+from synapse.logging.context import (
+    ContextResourceUsage,
+    LoggingContext,
+    current_context,
+)
 from synapse.metrics import InFlightGauge
-from synapse.util.logcontext import LoggingContext
 
 logger = logging.getLogger(__name__)
 
@@ -30,108 +33,123 @@ block_counter = Counter("synapse_util_metrics_block_count", "", ["block_name"])
 block_timer = Counter("synapse_util_metrics_block_time_seconds", "", ["block_name"])
 
 block_ru_utime = Counter(
-    "synapse_util_metrics_block_ru_utime_seconds", "", ["block_name"])
+    "synapse_util_metrics_block_ru_utime_seconds", "", ["block_name"]
+)
 
 block_ru_stime = Counter(
-    "synapse_util_metrics_block_ru_stime_seconds", "", ["block_name"])
+    "synapse_util_metrics_block_ru_stime_seconds", "", ["block_name"]
+)
 
 block_db_txn_count = Counter(
-    "synapse_util_metrics_block_db_txn_count", "", ["block_name"])
+    "synapse_util_metrics_block_db_txn_count", "", ["block_name"]
+)
 
 # seconds spent waiting for db txns, excluding scheduling time, in this block
 block_db_txn_duration = Counter(
-    "synapse_util_metrics_block_db_txn_duration_seconds", "", ["block_name"])
+    "synapse_util_metrics_block_db_txn_duration_seconds", "", ["block_name"]
+)
 
 # seconds spent waiting for a db connection, in this block
 block_db_sched_duration = Counter(
-    "synapse_util_metrics_block_db_sched_duration_seconds", "", ["block_name"])
+    "synapse_util_metrics_block_db_sched_duration_seconds", "", ["block_name"]
+)
 
 # Tracks the number of blocks currently active
 in_flight = InFlightGauge(
-    "synapse_util_metrics_block_in_flight", "",
+    "synapse_util_metrics_block_in_flight",
+    "",
     labels=["block_name"],
     sub_metrics=["real_time_max", "real_time_sum"],
 )
 
+T = TypeVar("T", bound=Callable[..., Any])
 
-def measure_func(name):
-    def wrapper(func):
+
+def measure_func(name: Optional[str] = None) -> Callable[[T], T]:
+    """
+    Used to decorate an async function with a `Measure` context manager.
+
+    Usage:
+
+    @measure_func()
+    async def foo(...):
+        ...
+
+    Which is analogous to:
+
+    async def foo(...):
+        with Measure(...):
+            ...
+
+    """
+
+    def wrapper(func: T) -> T:
+        block_name = func.__name__ if name is None else name
+
         @wraps(func)
-        @defer.inlineCallbacks
-        def measured_func(self, *args, **kwargs):
-            with Measure(self.clock, name):
-                r = yield func(self, *args, **kwargs)
-            defer.returnValue(r)
-        return measured_func
+        async def measured_func(self, *args, **kwargs):
+            with Measure(self.clock, block_name):
+                r = await func(self, *args, **kwargs)
+            return r
+
+        return cast(T, measured_func)
+
     return wrapper
 
 
-class Measure(object):
+class Measure:
     __slots__ = [
-        "clock", "name", "start_context", "start",
-        "created_context",
-        "start_usage",
+        "clock",
+        "name",
+        "_logging_context",
+        "start",
     ]
 
     def __init__(self, clock, name):
         self.clock = clock
         self.name = name
-        self.start_context = None
+        parent_context = current_context()
+        self._logging_context = LoggingContext(
+            "Measure[%s]" % (self.name,), parent_context
+        )
         self.start = None
-        self.created_context = False
 
-    def __enter__(self):
+    def __enter__(self) -> "Measure":
+        if self.start is not None:
+            raise RuntimeError("Measure() objects cannot be re-used")
+
         self.start = self.clock.time()
-        self.start_context = LoggingContext.current_context()
-        if not self.start_context:
-            self.start_context = LoggingContext("Measure")
-            self.start_context.__enter__()
-            self.created_context = True
-
-        self.start_usage = self.start_context.get_resource_usage()
-
+        self._logging_context.__enter__()
         in_flight.register((self.name,), self._update_in_flight)
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if isinstance(exc_type, Exception) or not self.start_context:
-            return
-
-        in_flight.unregister((self.name,), self._update_in_flight)
+        if self.start is None:
+            raise RuntimeError("Measure() block exited without being entered")
 
         duration = self.clock.time() - self.start
+        usage = self.get_resource_usage()
 
-        block_counter.labels(self.name).inc()
-        block_timer.labels(self.name).inc(duration)
+        in_flight.unregister((self.name,), self._update_in_flight)
+        self._logging_context.__exit__(exc_type, exc_val, exc_tb)
 
-        context = LoggingContext.current_context()
-
-        if context != self.start_context:
-            logger.warn(
-                "Context has unexpectedly changed from '%s' to '%s'. (%r)",
-                self.start_context, context, self.name
-            )
-            return
-
-        if not context:
-            logger.warn("Expected context. (%r)", self.name)
-            return
-
-        current = context.get_resource_usage()
-        usage = current - self.start_usage
         try:
+            block_counter.labels(self.name).inc()
+            block_timer.labels(self.name).inc(duration)
             block_ru_utime.labels(self.name).inc(usage.ru_utime)
             block_ru_stime.labels(self.name).inc(usage.ru_stime)
             block_db_txn_count.labels(self.name).inc(usage.db_txn_count)
             block_db_txn_duration.labels(self.name).inc(usage.db_txn_duration_sec)
             block_db_sched_duration.labels(self.name).inc(usage.db_sched_duration_sec)
         except ValueError:
-            logger.warn(
-                "Failed to save metrics! OLD: %r, NEW: %r",
-                self.start_usage, current
-            )
+            logger.warning("Failed to save metrics! Usage: %s", usage)
 
-        if self.created_context:
-            self.start_context.__exit__(exc_type, exc_val, exc_tb)
+    def get_resource_usage(self) -> ContextResourceUsage:
+        """Get the resources used within this Measure block
+
+        If the Measure block is still active, returns the resource usage so far.
+        """
+        return self._logging_context.get_resource_usage()
 
     def _update_in_flight(self, metrics):
         """Gets called when processing in flight metrics

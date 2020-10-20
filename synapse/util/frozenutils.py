@@ -13,9 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from six import binary_type, text_type
+import json
 
-from canonicaljson import json
 from frozendict import frozendict
 
 
@@ -26,11 +25,11 @@ def freeze(o):
     if isinstance(o, frozendict):
         return o
 
-    if isinstance(o, (binary_type, text_type)):
+    if isinstance(o, (bytes, str)):
         return o
 
     try:
-        return tuple([freeze(i) for i in o])
+        return tuple(freeze(i) for i in o)
     except TypeError:
         pass
 
@@ -41,7 +40,7 @@ def unfreeze(o):
     if isinstance(o, (dict, frozendict)):
         return dict({k: unfreeze(v) for k, v in o.items()})
 
-    if isinstance(o, (binary_type, text_type)):
+    if isinstance(o, (bytes, str)):
         return o
 
     try:
@@ -60,11 +59,13 @@ def _handle_frozendict(obj):
         # fishing the protected dict out of the object is a bit nasty,
         # but we don't really want the overhead of copying the dict.
         return obj._dict
-    raise TypeError('Object of type %s is not JSON serializable' %
-                    obj.__class__.__name__)
+    raise TypeError(
+        "Object of type %s is not JSON serializable" % obj.__class__.__name__
+    )
 
 
-# A JSONEncoder which is capable of encoding frozendics without barfing
+# A JSONEncoder which is capable of encoding frozendicts without barfing.
+# Additionally reduce the whitespace produced by JSON encoding.
 frozendict_json_encoder = json.JSONEncoder(
-    default=_handle_frozendict,
+    allow_nan=False, separators=(",", ":"), default=_handle_frozendict,
 )

@@ -15,15 +15,13 @@
 
 import itertools
 import logging
+from typing import Iterable
 
 from unpaddedbase64 import decode_base64, encode_base64
 
-from twisted.internet import defer
-
 from synapse.api.constants import EventTypes, Membership
-from synapse.api.errors import SynapseError
+from synapse.api.errors import NotFoundError, SynapseError
 from synapse.api.filtering import Filter
-from synapse.events.utils import serialize_event
 from synapse.storage.state import StateFilter
 from synapse.visibility import filter_events_for_client
 
@@ -33,12 +31,14 @@ logger = logging.getLogger(__name__)
 
 
 class SearchHandler(BaseHandler):
-
     def __init__(self, hs):
-        super(SearchHandler, self).__init__(hs)
+        super().__init__(hs)
+        self._event_serializer = hs.get_event_client_serializer()
+        self.storage = hs.get_storage()
+        self.state_store = self.storage.state
+        self.auth = hs.get_auth()
 
-    @defer.inlineCallbacks
-    def get_old_rooms_from_upgraded_room(self, room_id):
+    async def get_old_rooms_from_upgraded_room(self, room_id: str) -> Iterable[str]:
         """Retrieves room IDs of old rooms in the history of an upgraded room.
 
         We do so by checking the m.room.create event of the room for a
@@ -49,31 +49,45 @@ class SearchHandler(BaseHandler):
         The full list of all found rooms in then returned.
 
         Args:
-            room_id (str): id of the room to search through.
+            room_id: id of the room to search through.
 
         Returns:
-            Deferred[iterable[unicode]]: predecessor room ids
+            Predecessor room ids
         """
 
         historical_room_ids = []
 
-        while True:
-            predecessor = yield self.store.get_room_predecessor(room_id)
+        # The initial room must have been known for us to get this far
+        predecessor = await self.store.get_room_predecessor(room_id)
 
-            # If no predecessor, assume we've hit a dead end
+        while True:
             if not predecessor:
+                # We have reached the end of the chain of predecessors
                 break
 
-            # Add predecessor's room ID
-            historical_room_ids.append(predecessor["room_id"])
+            if not isinstance(predecessor.get("room_id"), str):
+                # This predecessor object is malformed. Exit here
+                break
 
-            # Scan through the old room for further predecessors
-            room_id = predecessor["room_id"]
+            predecessor_room_id = predecessor["room_id"]
 
-        defer.returnValue(historical_room_ids)
+            # Don't add it to the list until we have checked that we are in the room
+            try:
+                next_predecessor_room = await self.store.get_room_predecessor(
+                    predecessor_room_id
+                )
+            except NotFoundError:
+                # The predecessor is not a known room, so we are done here
+                break
 
-    @defer.inlineCallbacks
-    def search(self, user, content, batch=None):
+            historical_room_ids.append(predecessor_room_id)
+
+            # And repeat
+            predecessor = next_predecessor_room
+
+        return historical_room_ids
+
+    async def search(self, user, content, batch=None):
         """Performs a full text search for a user.
 
         Args:
@@ -93,7 +107,7 @@ class SearchHandler(BaseHandler):
         batch_token = None
         if batch:
             try:
-                b = decode_base64(batch).decode('ascii')
+                b = decode_base64(batch).decode("ascii")
                 batch_group, batch_group_key, batch_token = b.split("\n")
 
                 assert batch_group is not None
@@ -104,7 +118,9 @@ class SearchHandler(BaseHandler):
 
         logger.info(
             "Search batch properties: %r, %r, %r",
-            batch_group, batch_group_key, batch_token,
+            batch_group,
+            batch_group_key,
+            batch_token,
         )
 
         logger.info("Search content: %s", content)
@@ -116,9 +132,9 @@ class SearchHandler(BaseHandler):
             search_term = room_cat["search_term"]
 
             # Which "keys" to search over in FTS query
-            keys = room_cat.get("keys", [
-                "content.body", "content.name", "content.topic",
-            ])
+            keys = room_cat.get(
+                "keys", ["content.body", "content.name", "content.topic"]
+            )
 
             # Filter to apply to results
             filter_dict = room_cat.get("filter", {})
@@ -130,9 +146,7 @@ class SearchHandler(BaseHandler):
             include_state = room_cat.get("include_state", False)
 
             # Include context around each event?
-            event_context = room_cat.get(
-                "event_context", None
-            )
+            event_context = room_cat.get("event_context", None)
 
             # Group results together? May allow clients to paginate within a
             # group
@@ -140,12 +154,8 @@ class SearchHandler(BaseHandler):
             group_keys = [g["key"] for g in group_by]
 
             if event_context is not None:
-                before_limit = int(event_context.get(
-                    "before_limit", 5
-                ))
-                after_limit = int(event_context.get(
-                    "after_limit", 5
-                ))
+                before_limit = int(event_context.get("before_limit", 5))
+                after_limit = int(event_context.get("after_limit", 5))
 
                 # Return the historic display name and avatar for the senders
                 # of the events?
@@ -159,18 +169,19 @@ class SearchHandler(BaseHandler):
         if set(group_keys) - {"room_id", "sender"}:
             raise SynapseError(
                 400,
-                "Invalid group by keys: %r" % (set(group_keys) - {"room_id", "sender"},)
+                "Invalid group by keys: %r"
+                % (set(group_keys) - {"room_id", "sender"},),
             )
 
         search_filter = Filter(filter_dict)
 
         # TODO: Search through left rooms too
-        rooms = yield self.store.get_rooms_for_user_where_membership_is(
+        rooms = await self.store.get_rooms_for_local_user_where_membership_is(
             user.to_string(),
             membership_list=[Membership.JOIN],
             # membership_list=[Membership.JOIN, Membership.LEAVE, Membership.Ban],
         )
-        room_ids = set(r.room_id for r in rooms)
+        room_ids = {r.room_id for r in rooms}
 
         # If doing a subset of all rooms seearch, check if any of the rooms
         # are from an upgraded room, and search their contents as well
@@ -178,7 +189,7 @@ class SearchHandler(BaseHandler):
             historical_room_ids = []
             for room_id in search_filter.rooms:
                 # Add any previous rooms to the search if they exist
-                ids = yield self.get_old_rooms_from_upgraded_room(room_id)
+                ids = await self.get_old_rooms_from_upgraded_room(room_id)
                 historical_room_ids += ids
 
             # Prevent any historical events from being filtered
@@ -190,15 +201,11 @@ class SearchHandler(BaseHandler):
             room_ids.intersection_update({batch_group_key})
 
         if not room_ids:
-            defer.returnValue({
+            return {
                 "search_categories": {
-                    "room_events": {
-                        "results": [],
-                        "count": 0,
-                        "highlights": [],
-                    }
+                    "room_events": {"results": [], "count": 0, "highlights": []}
                 }
-            })
+            }
 
         rank_map = {}  # event_id -> rank of event
         allowed_events = []
@@ -213,9 +220,7 @@ class SearchHandler(BaseHandler):
         count = None
 
         if order_by == "rank":
-            search_result = yield self.store.search_msgs(
-                room_ids, search_term, keys
-            )
+            search_result = await self.store.search_msgs(room_ids, search_term, keys)
 
             count = search_result["count"]
 
@@ -230,24 +235,22 @@ class SearchHandler(BaseHandler):
 
             filtered_events = search_filter.filter([r["event"] for r in results])
 
-            events = yield filter_events_for_client(
-                self.store, user.to_string(), filtered_events
+            events = await filter_events_for_client(
+                self.storage, user.to_string(), filtered_events
             )
 
             events.sort(key=lambda e: -rank_map[e.event_id])
-            allowed_events = events[:search_filter.limit()]
+            allowed_events = events[: search_filter.limit()]
 
             for e in allowed_events:
-                rm = room_groups.setdefault(e.room_id, {
-                    "results": [],
-                    "order": rank_map[e.event_id],
-                })
+                rm = room_groups.setdefault(
+                    e.room_id, {"results": [], "order": rank_map[e.event_id]}
+                )
                 rm["results"].append(e.event_id)
 
-                s = sender_group.setdefault(e.sender, {
-                    "results": [],
-                    "order": rank_map[e.event_id],
-                })
+                s = sender_group.setdefault(
+                    e.sender, {"results": [], "order": rank_map[e.event_id]}
+                )
                 s["results"].append(e.event_id)
 
         elif order_by == "recent":
@@ -261,8 +264,11 @@ class SearchHandler(BaseHandler):
             # But only go around 5 times since otherwise synapse will be sad.
             while len(room_events) < search_filter.limit() and i < 5:
                 i += 1
-                search_result = yield self.store.search_rooms(
-                    room_ids, search_term, keys, search_filter.limit() * 2,
+                search_result = await self.store.search_rooms(
+                    room_ids,
+                    search_term,
+                    keys,
+                    search_filter.limit() * 2,
                     pagination_token=pagination_token,
                 )
 
@@ -277,16 +283,14 @@ class SearchHandler(BaseHandler):
 
                 rank_map.update({r["event"].event_id: r["rank"] for r in results})
 
-                filtered_events = search_filter.filter([
-                    r["event"] for r in results
-                ])
+                filtered_events = search_filter.filter([r["event"] for r in results])
 
-                events = yield filter_events_for_client(
-                    self.store, user.to_string(), filtered_events
+                events = await filter_events_for_client(
+                    self.storage, user.to_string(), filtered_events
                 )
 
                 room_events.extend(events)
-                room_events = room_events[:search_filter.limit()]
+                room_events = room_events[: search_filter.limit()]
 
                 if len(results) < search_filter.limit() * 2:
                     pagination_token = None
@@ -295,9 +299,7 @@ class SearchHandler(BaseHandler):
                     pagination_token = results[-1]["pagination_token"]
 
             for event in room_events:
-                group = room_groups.setdefault(event.room_id, {
-                    "results": [],
-                })
+                group = room_groups.setdefault(event.room_id, {"results": []})
                 group["results"].append(event.event_id)
 
             if room_events and len(room_events) >= search_filter.limit():
@@ -309,18 +311,23 @@ class SearchHandler(BaseHandler):
                 # it returns more from the same group (if applicable) rather
                 # than reverting to searching all results again.
                 if batch_group and batch_group_key:
-                    global_next_batch = encode_base64(("%s\n%s\n%s" % (
-                        batch_group, batch_group_key, pagination_token
-                    )).encode('ascii'))
+                    global_next_batch = encode_base64(
+                        (
+                            "%s\n%s\n%s"
+                            % (batch_group, batch_group_key, pagination_token)
+                        ).encode("ascii")
+                    )
                 else:
-                    global_next_batch = encode_base64(("%s\n%s\n%s" % (
-                        "all", "", pagination_token
-                    )).encode('ascii'))
+                    global_next_batch = encode_base64(
+                        ("%s\n%s\n%s" % ("all", "", pagination_token)).encode("ascii")
+                    )
 
                 for room_id, group in room_groups.items():
-                    group["next_batch"] = encode_base64(("%s\n%s\n%s" % (
-                        "room_id", room_id, pagination_token
-                    )).encode('ascii'))
+                    group["next_batch"] = encode_base64(
+                        ("%s\n%s\n%s" % ("room_id", room_id, pagination_token)).encode(
+                            "ascii"
+                        )
+                    )
 
             allowed_events.extend(room_events)
 
@@ -333,42 +340,43 @@ class SearchHandler(BaseHandler):
         # If client has asked for "context" for each event (i.e. some surrounding
         # events and state), fetch that
         if event_context is not None:
-            now_token = yield self.hs.get_event_sources().get_current_token()
+            now_token = self.hs.get_event_sources().get_current_token()
 
             contexts = {}
             for event in allowed_events:
-                res = yield self.store.get_events_around(
-                    event.room_id, event.event_id, before_limit, after_limit,
+                res = await self.store.get_events_around(
+                    event.room_id, event.event_id, before_limit, after_limit
                 )
 
                 logger.info(
                     "Context for search returned %d and %d events",
-                    len(res["events_before"]), len(res["events_after"]),
+                    len(res["events_before"]),
+                    len(res["events_after"]),
                 )
 
-                res["events_before"] = yield filter_events_for_client(
-                    self.store, user.to_string(), res["events_before"]
+                res["events_before"] = await filter_events_for_client(
+                    self.storage, user.to_string(), res["events_before"]
                 )
 
-                res["events_after"] = yield filter_events_for_client(
-                    self.store, user.to_string(), res["events_after"]
+                res["events_after"] = await filter_events_for_client(
+                    self.storage, user.to_string(), res["events_after"]
                 )
 
-                res["start"] = now_token.copy_and_replace(
+                res["start"] = await now_token.copy_and_replace(
                     "room_key", res["start"]
-                ).to_string()
+                ).to_string(self.store)
 
-                res["end"] = now_token.copy_and_replace(
+                res["end"] = await now_token.copy_and_replace(
                     "room_key", res["end"]
-                ).to_string()
+                ).to_string(self.store)
 
                 if include_profile:
-                    senders = set(
+                    senders = {
                         ev.sender
                         for ev in itertools.chain(
                             res["events_before"], [event], res["events_after"]
                         )
-                    )
+                    }
 
                     if res["events_after"]:
                         last_event_id = res["events_after"][-1].event_id
@@ -379,7 +387,7 @@ class SearchHandler(BaseHandler):
                         [(EventTypes.Member, sender) for sender in senders]
                     )
 
-                    state = yield self.store.get_state_for_event(
+                    state = await self.state_store.get_state_for_event(
                         last_event_id, state_filter
                     )
 
@@ -401,20 +409,18 @@ class SearchHandler(BaseHandler):
         time_now = self.clock.time_msec()
 
         for context in contexts.values():
-            context["events_before"] = [
-                serialize_event(e, time_now)
-                for e in context["events_before"]
-            ]
-            context["events_after"] = [
-                serialize_event(e, time_now)
-                for e in context["events_after"]
-            ]
+            context["events_before"] = await self._event_serializer.serialize_events(
+                context["events_before"], time_now
+            )
+            context["events_after"] = await self._event_serializer.serialize_events(
+                context["events_after"], time_now
+            )
 
         state_results = {}
         if include_state:
-            rooms = set(e.room_id for e in allowed_events)
+            rooms = {e.room_id for e in allowed_events}
             for room_id in rooms:
-                state = yield self.state_handler.get_current_state(room_id)
+                state = await self.state_handler.get_current_state(room_id)
                 state_results[room_id] = list(state.values())
 
             state_results.values()
@@ -422,14 +428,17 @@ class SearchHandler(BaseHandler):
         # We're now about to serialize the events. We should not make any
         # blocking calls after this. Otherwise the 'age' will be wrong
 
-        results = [
-            {
-                "rank": rank_map[e.event_id],
-                "result": serialize_event(e, time_now),
-                "context": contexts.get(e.event_id, {}),
-            }
-            for e in allowed_events
-        ]
+        results = []
+        for e in allowed_events:
+            results.append(
+                {
+                    "rank": rank_map[e.event_id],
+                    "result": (
+                        await self._event_serializer.serialize_event(e, time_now)
+                    ),
+                    "context": contexts.get(e.event_id, {}),
+                }
+            )
 
         rooms_cat_res = {
             "results": results,
@@ -438,10 +447,13 @@ class SearchHandler(BaseHandler):
         }
 
         if state_results:
-            rooms_cat_res["state"] = {
-                room_id: [serialize_event(e, time_now) for e in state]
-                for room_id, state in state_results.items()
-            }
+            s = {}
+            for room_id, state in state_results.items():
+                s[room_id] = await self._event_serializer.serialize_events(
+                    state, time_now
+                )
+
+            rooms_cat_res["state"] = s
 
         if room_groups and "room_id" in group_keys:
             rooms_cat_res.setdefault("groups", {})["room_id"] = room_groups
@@ -452,8 +464,4 @@ class SearchHandler(BaseHandler):
         if global_next_batch:
             rooms_cat_res["next_batch"] = global_next_batch
 
-        defer.returnValue({
-            "search_categories": {
-                "room_events": rooms_cat_res
-            }
-        })
+        return {"search_categories": {"room_events": rooms_cat_res}}

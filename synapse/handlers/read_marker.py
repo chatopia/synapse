@@ -14,26 +14,29 @@
 # limitations under the License.
 
 import logging
-
-from twisted.internet import defer
+from typing import TYPE_CHECKING
 
 from synapse.util.async_helpers import Linearizer
 
 from ._base import BaseHandler
 
+if TYPE_CHECKING:
+    from synapse.app.homeserver import HomeServer
+
 logger = logging.getLogger(__name__)
 
 
 class ReadMarkerHandler(BaseHandler):
-    def __init__(self, hs):
-        super(ReadMarkerHandler, self).__init__(hs)
+    def __init__(self, hs: "HomeServer"):
+        super().__init__(hs)
         self.server_name = hs.config.server_name
         self.store = hs.get_datastore()
         self.read_marker_linearizer = Linearizer(name="read_marker")
         self.notifier = hs.get_notifier()
 
-    @defer.inlineCallbacks
-    def received_client_read_marker(self, room_id, user_id, event_id):
+    async def received_client_read_marker(
+        self, room_id: str, user_id: str, event_id: str
+    ) -> None:
         """Updates the read marker for a given user in a given room if the event ID given
         is ahead in the stream relative to the current read marker.
 
@@ -41,25 +44,22 @@ class ReadMarkerHandler(BaseHandler):
         the read marker has changed.
         """
 
-        with (yield self.read_marker_linearizer.queue((room_id, user_id))):
-            existing_read_marker = yield self.store.get_account_data_for_room_and_type(
-                user_id, room_id, "m.fully_read",
+        with await self.read_marker_linearizer.queue((room_id, user_id)):
+            existing_read_marker = await self.store.get_account_data_for_room_and_type(
+                user_id, room_id, "m.fully_read"
             )
 
             should_update = True
 
             if existing_read_marker:
                 # Only update if the new marker is ahead in the stream
-                should_update = yield self.store.is_event_after(
-                    event_id,
-                    existing_read_marker['event_id']
+                should_update = await self.store.is_event_after(
+                    event_id, existing_read_marker["event_id"]
                 )
 
             if should_update:
-                content = {
-                    "event_id": event_id
-                }
-                max_id = yield self.store.add_account_data_to_room(
+                content = {"event_id": event_id}
+                max_id = await self.store.add_account_data_to_room(
                     user_id, room_id, "m.fully_read", content
                 )
                 self.notifier.on_new_event("account_data_key", max_id, users=[user_id])

@@ -3,8 +3,6 @@ import json
 import sys
 import time
 
-import six
-
 import psycopg2
 import yaml
 from canonicaljson import encode_canonical_json
@@ -12,10 +10,7 @@ from signedjson.key import read_signing_keys
 from signedjson.sign import sign_json
 from unpaddedbase64 import encode_base64
 
-if six.PY2:
-    db_type = six.moves.builtins.buffer
-else:
-    db_type = memoryview
+db_binary_type = memoryview
 
 
 def select_v1_keys(connection):
@@ -72,11 +67,11 @@ def rows_v2(server, json):
     valid_until = json["valid_until_ts"]
     key_json = encode_canonical_json(json)
     for key_id in json["verify_keys"]:
-        yield (server, key_id, "-", valid_until, valid_until, db_type(key_json))
+        yield (server, key_id, "-", valid_until, valid_until, db_binary_type(key_json))
 
 
 def main():
-    config = yaml.load(open(sys.argv[1]))
+    config = yaml.safe_load(open(sys.argv[1]))
     valid_until = int(time.time() / (3600 * 24)) * 1000 * 3600 * 24
 
     server_name = config["server_name"]
@@ -103,7 +98,7 @@ def main():
 
     yaml.safe_dump(result, sys.stdout, default_flow_style=False)
 
-    rows = list(row for server, json in result.items() for row in rows_v2(server, json))
+    rows = [row for server, json in result.items() for row in rows_v2(server, json)]
 
     cursor = connection.cursor()
     cursor.executemany(
@@ -116,5 +111,5 @@ def main():
     connection.commit()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

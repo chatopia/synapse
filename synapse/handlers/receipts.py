@@ -13,20 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+from typing import List, Tuple
 
-from twisted.internet import defer
-
-from synapse.metrics.background_process_metrics import run_as_background_process
-from synapse.types import get_domain_from_id
-
-from ._base import BaseHandler
+from synapse.appservice import ApplicationService
+from synapse.handlers._base import BaseHandler
+from synapse.types import JsonDict, ReadReceipt, get_domain_from_id
+from synapse.util.async_helpers import maybe_awaitable
 
 logger = logging.getLogger(__name__)
 
 
 class ReceiptsHandler(BaseHandler):
     def __init__(self, hs):
-        super(ReceiptsHandler, self).__init__(hs)
+        super().__init__(hs)
 
         self.server_name = hs.config.server_name
         self.store = hs.get_datastore()
@@ -38,66 +37,46 @@ class ReceiptsHandler(BaseHandler):
         self.clock = self.hs.get_clock()
         self.state = hs.get_state_handler()
 
-    @defer.inlineCallbacks
-    def received_client_receipt(self, room_id, receipt_type, user_id,
-                                event_id):
-        """Called when a client tells us a local user has read up to the given
-        event_id in the room.
-        """
-        receipt = {
-            "room_id": room_id,
-            "receipt_type": receipt_type,
-            "user_id": user_id,
-            "event_ids": [event_id],
-            "data": {
-                "ts": int(self.clock.time_msec()),
-            }
-        }
-
-        is_new = yield self._handle_new_receipts([receipt])
-
-        if is_new:
-            # fire off a process in the background to send the receipt to
-            # remote servers
-            run_as_background_process(
-                'push_receipts_to_remotes', self._push_remotes, receipt
-            )
-
-    @defer.inlineCallbacks
-    def _received_remote_receipt(self, origin, content):
+    async def _received_remote_receipt(self, origin, content):
         """Called when we receive an EDU of type m.receipt from a remote HS.
         """
-        receipts = [
-            {
-                "room_id": room_id,
-                "receipt_type": receipt_type,
-                "user_id": user_id,
-                "event_ids": user_values["event_ids"],
-                "data": user_values.get("data", {}),
-            }
-            for room_id, room_values in content.items()
-            for receipt_type, users in room_values.items()
-            for user_id, user_values in users.items()
-        ]
+        receipts = []
+        for room_id, room_values in content.items():
+            for receipt_type, users in room_values.items():
+                for user_id, user_values in users.items():
+                    if get_domain_from_id(user_id) != origin:
+                        logger.info(
+                            "Received receipt for user %r from server %s, ignoring",
+                            user_id,
+                            origin,
+                        )
+                        continue
 
-        yield self._handle_new_receipts(receipts)
+                    receipts.append(
+                        ReadReceipt(
+                            room_id=room_id,
+                            receipt_type=receipt_type,
+                            user_id=user_id,
+                            event_ids=user_values["event_ids"],
+                            data=user_values.get("data", {}),
+                        )
+                    )
 
-    @defer.inlineCallbacks
-    def _handle_new_receipts(self, receipts):
+        await self._handle_new_receipts(receipts)
+
+    async def _handle_new_receipts(self, receipts):
         """Takes a list of receipts, stores them and informs the notifier.
         """
         min_batch_id = None
         max_batch_id = None
 
         for receipt in receipts:
-            room_id = receipt["room_id"]
-            receipt_type = receipt["receipt_type"]
-            user_id = receipt["user_id"]
-            event_ids = receipt["event_ids"]
-            data = receipt["data"]
-
-            res = yield self.store.insert_receipt(
-                room_id, receipt_type, user_id, event_ids, data
+            res = await self.store.insert_receipt(
+                receipt.room_id,
+                receipt.receipt_type,
+                receipt.user_id,
+                receipt.event_ids,
+                receipt.data,
             )
 
             if not res:
@@ -113,111 +92,86 @@ class ReceiptsHandler(BaseHandler):
 
         if min_batch_id is None:
             # no new receipts
-            defer.returnValue(False)
+            return False
 
-        affected_room_ids = list(set([r["room_id"] for r in receipts]))
+        affected_room_ids = list({r.room_id for r in receipts})
 
-        self.notifier.on_new_event(
-            "receipt_key", max_batch_id, rooms=affected_room_ids
-        )
+        self.notifier.on_new_event("receipt_key", max_batch_id, rooms=affected_room_ids)
         # Note that the min here shouldn't be relied upon to be accurate.
-        yield self.hs.get_pusherpool().on_new_receipts(
-            min_batch_id, max_batch_id, affected_room_ids,
+        await maybe_awaitable(
+            self.hs.get_pusherpool().on_new_receipts(
+                min_batch_id, max_batch_id, affected_room_ids
+            )
         )
 
-        defer.returnValue(True)
+        return True
 
-    @defer.inlineCallbacks
-    def _push_remotes(self, receipt):
-        """Given a receipt, works out which remote servers should be
-        poked and pokes them.
+    async def received_client_receipt(self, room_id, receipt_type, user_id, event_id):
+        """Called when a client tells us a local user has read up to the given
+        event_id in the room.
         """
-        try:
-            # TODO: optimise this to move some of the work to the workers.
-            room_id = receipt["room_id"]
-            receipt_type = receipt["receipt_type"]
-            user_id = receipt["user_id"]
-            event_ids = receipt["event_ids"]
-            data = receipt["data"]
-
-            users = yield self.state.get_current_user_in_room(room_id)
-            remotedomains = set(get_domain_from_id(u) for u in users)
-            remotedomains = remotedomains.copy()
-            remotedomains.discard(self.server_name)
-
-            logger.debug("Sending receipt to: %r", remotedomains)
-
-            for domain in remotedomains:
-                self.federation.send_edu(
-                    destination=domain,
-                    edu_type="m.receipt",
-                    content={
-                        room_id: {
-                            receipt_type: {
-                                user_id: {
-                                    "event_ids": event_ids,
-                                    "data": data,
-                                }
-                            }
-                        },
-                    },
-                    key=(room_id, receipt_type, user_id),
-                )
-        except Exception:
-            logger.exception("Error pushing receipts to remote servers")
-
-    @defer.inlineCallbacks
-    def get_receipts_for_room(self, room_id, to_key):
-        """Gets all receipts for a room, upto the given key.
-        """
-        result = yield self.store.get_linearized_receipts_for_room(
-            room_id,
-            to_key=to_key,
+        receipt = ReadReceipt(
+            room_id=room_id,
+            receipt_type=receipt_type,
+            user_id=user_id,
+            event_ids=[event_id],
+            data={"ts": int(self.clock.time_msec())},
         )
 
-        if not result:
-            defer.returnValue([])
+        is_new = await self._handle_new_receipts([receipt])
+        if not is_new:
+            return
 
-        defer.returnValue(result)
+        await self.federation.send_read_receipt(receipt)
 
 
-class ReceiptEventSource(object):
+class ReceiptEventSource:
     def __init__(self, hs):
         self.store = hs.get_datastore()
 
-    @defer.inlineCallbacks
-    def get_new_events(self, from_key, room_ids, **kwargs):
+    async def get_new_events(self, from_key, room_ids, **kwargs):
         from_key = int(from_key)
-        to_key = yield self.get_current_key()
+        to_key = self.get_current_key()
 
         if from_key == to_key:
-            defer.returnValue(([], to_key))
+            return [], to_key
 
-        events = yield self.store.get_linearized_receipts_for_rooms(
-            room_ids,
-            from_key=from_key,
-            to_key=to_key,
+        events = await self.store.get_linearized_receipts_for_rooms(
+            room_ids, from_key=from_key, to_key=to_key
         )
 
-        defer.returnValue((events, to_key))
+        return (events, to_key)
 
-    def get_current_key(self, direction='f'):
+    async def get_new_events_as(
+        self, from_key: int, service: ApplicationService
+    ) -> Tuple[List[JsonDict], int]:
+        """Returns a set of new receipt events that an appservice
+        may be interested in.
+
+        Args:
+            from_key: the stream position at which events should be fetched from
+            service: The appservice which may be interested
+        """
+        from_key = int(from_key)
+        to_key = self.get_current_key()
+
+        if from_key == to_key:
+            return [], to_key
+
+        # We first need to fetch all new receipts
+        rooms_to_events = await self.store.get_linearized_receipts_for_all_rooms(
+            from_key=from_key, to_key=to_key
+        )
+
+        # Then filter down to rooms that the AS can read
+        events = []
+        for room_id, event in rooms_to_events.items():
+            if not await service.matches_user_in_member_list(room_id, self.store):
+                continue
+
+            events.append(event)
+
+        return (events, to_key)
+
+    def get_current_key(self, direction="f"):
         return self.store.get_max_receipt_stream_id()
-
-    @defer.inlineCallbacks
-    def get_pagination_rows(self, user, config, key):
-        to_key = int(config.from_key)
-
-        if config.to_key:
-            from_key = int(config.to_key)
-        else:
-            from_key = None
-
-        room_ids = yield self.store.get_rooms_for_user(user.to_string())
-        events = yield self.store.get_linearized_receipts_for_rooms(
-            room_ids,
-            from_key=from_key,
-            to_key=to_key,
-        )
-
-        defer.returnValue((events, to_key))

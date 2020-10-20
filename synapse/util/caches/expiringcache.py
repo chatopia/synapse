@@ -16,8 +16,7 @@
 import logging
 from collections import OrderedDict
 
-from six import iteritems, itervalues
-
+from synapse.config import cache as cache_config
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.util.caches import register_cache
 
@@ -27,9 +26,16 @@ logger = logging.getLogger(__name__)
 SENTINEL = object()
 
 
-class ExpiringCache(object):
-    def __init__(self, cache_name, clock, max_len=0, expiry_ms=0,
-                 reset_expiry_on_get=False, iterable=False):
+class ExpiringCache:
+    def __init__(
+        self,
+        cache_name,
+        clock,
+        max_len=0,
+        expiry_ms=0,
+        reset_expiry_on_get=False,
+        iterable=False,
+    ):
         """
         Args:
             cache_name (str): Name of this cache, used for logging.
@@ -44,15 +50,16 @@ class ExpiringCache(object):
                 an item on access. Defaults to False.
             iterable (bool): If true, the size is calculated by summing the
                 sizes of all entries, rather than the number of entries.
-
         """
         self._cache_name = cache_name
 
+        self._original_max_size = max_len
+
+        self._max_size = int(max_len * cache_config.properties.default_factor_size)
+
         self._clock = clock
 
-        self._max_len = max_len
         self._expiry_ms = expiry_ms
-
         self._reset_expiry_on_get = reset_expiry_on_get
 
         self._cache = OrderedDict()
@@ -67,8 +74,7 @@ class ExpiringCache(object):
 
         def f():
             return run_as_background_process(
-                "prune_cache_%s" % self._cache_name,
-                self._prune_cache,
+                "prune_cache_%s" % self._cache_name, self._prune_cache
             )
 
         self._clock.looping_call(f, self._expiry_ms / 2)
@@ -76,9 +82,11 @@ class ExpiringCache(object):
     def __setitem__(self, key, value):
         now = self._clock.time_msec()
         self._cache[key] = _CacheEntry(now, value)
+        self.evict()
 
+    def evict(self):
         # Evict if there are now too many items
-        while self._max_len and len(self) > self._max_len:
+        while self._max_size and len(self) > self._max_size:
             _key, value = self._cache.popitem(last=False)
             if self.iterable:
                 self.metrics.inc_evictions(len(value.value))
@@ -140,7 +148,7 @@ class ExpiringCache(object):
 
         keys_to_delete = set()
 
-        for key, cache_entry in iteritems(self._cache):
+        for key, cache_entry in self._cache.items():
             if now - cache_entry.time > self._expiry_ms:
                 keys_to_delete.add(key)
 
@@ -153,17 +161,36 @@ class ExpiringCache(object):
 
         logger.debug(
             "[%s] _prune_cache before: %d, after len: %d",
-            self._cache_name, begin_length, len(self)
+            self._cache_name,
+            begin_length,
+            len(self),
         )
 
     def __len__(self):
         if self.iterable:
-            return sum(len(entry.value) for entry in itervalues(self._cache))
+            return sum(len(entry.value) for entry in self._cache.values())
         else:
             return len(self._cache)
 
+    def set_cache_factor(self, factor: float) -> bool:
+        """
+        Set the cache factor for this individual cache.
 
-class _CacheEntry(object):
+        This will trigger a resize if it changes, which may require evicting
+        items from the cache.
+
+        Returns:
+            bool: Whether the cache changed size or not.
+        """
+        new_size = int(self._original_max_size * factor)
+        if new_size != self._max_size:
+            self._max_size = new_size
+            self.evict()
+            return True
+        return False
+
+
+class _CacheEntry:
     __slots__ = ["time", "value"]
 
     def __init__(self, time, value):

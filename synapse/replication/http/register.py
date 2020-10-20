@@ -15,8 +15,6 @@
 
 import logging
 
-from twisted.internet import defer
-
 from synapse.http.servlet import parse_json_object_from_request
 from synapse.replication.http._base import ReplicationEndpoint
 
@@ -31,20 +29,26 @@ class ReplicationRegisterServlet(ReplicationEndpoint):
     PATH_ARGS = ("user_id",)
 
     def __init__(self, hs):
-        super(ReplicationRegisterServlet, self).__init__(hs)
+        super().__init__(hs)
         self.store = hs.get_datastore()
+        self.registration_handler = hs.get_registration_handler()
 
     @staticmethod
-    def _serialize_payload(
-        user_id, token, password_hash, was_guest, make_guest, appservice_id,
-        create_profile_with_displayname, admin, user_type,
+    async def _serialize_payload(
+        user_id,
+        password_hash,
+        was_guest,
+        make_guest,
+        appservice_id,
+        create_profile_with_displayname,
+        admin,
+        user_type,
+        address,
+        shadow_banned,
     ):
         """
         Args:
             user_id (str): The desired user ID to register.
-            token (str): The desired access token to use for this user. If this
-                is not None, the given access token is associated with the user
-                id.
             password_hash (str|None): Optional. The password hash for this user.
             was_guest (bool): Optional. Whether this is a guest account being
                 upgraded to a non-guest account.
@@ -56,9 +60,10 @@ class ReplicationRegisterServlet(ReplicationEndpoint):
             admin (boolean): is an admin user?
             user_type (str|None): type of user. One of the values from
                 api.constants.UserTypes, or None for a normal user.
+            address (str|None): the IP address used to perform the regitration.
+            shadow_banned (bool): Whether to shadow-ban the user
         """
         return {
-            "token": token,
             "password_hash": password_hash,
             "was_guest": was_guest,
             "make_guest": make_guest,
@@ -66,15 +71,17 @@ class ReplicationRegisterServlet(ReplicationEndpoint):
             "create_profile_with_displayname": create_profile_with_displayname,
             "admin": admin,
             "user_type": user_type,
+            "address": address,
+            "shadow_banned": shadow_banned,
         }
 
-    @defer.inlineCallbacks
-    def _handle_request(self, request, user_id):
+    async def _handle_request(self, request, user_id):
         content = parse_json_object_from_request(request)
 
-        yield self.store.register(
+        self.registration_handler.check_registration_ratelimit(content["address"])
+
+        await self.registration_handler.register_with_store(
             user_id=user_id,
-            token=content["token"],
             password_hash=content["password_hash"],
             was_guest=content["was_guest"],
             make_guest=content["make_guest"],
@@ -82,9 +89,11 @@ class ReplicationRegisterServlet(ReplicationEndpoint):
             create_profile_with_displayname=content["create_profile_with_displayname"],
             admin=content["admin"],
             user_type=content["user_type"],
+            address=content["address"],
+            shadow_banned=content["shadow_banned"],
         )
 
-        defer.returnValue((200, {}))
+        return 200, {}
 
 
 class ReplicationPostRegisterActionsServlet(ReplicationEndpoint):
@@ -95,13 +104,12 @@ class ReplicationPostRegisterActionsServlet(ReplicationEndpoint):
     PATH_ARGS = ("user_id",)
 
     def __init__(self, hs):
-        super(ReplicationPostRegisterActionsServlet, self).__init__(hs)
+        super().__init__(hs)
         self.store = hs.get_datastore()
         self.registration_handler = hs.get_registration_handler()
 
     @staticmethod
-    def _serialize_payload(user_id, auth_result, access_token, bind_email,
-                           bind_msisdn):
+    async def _serialize_payload(user_id, auth_result, access_token):
         """
         Args:
             user_id (str): The user ID that consented
@@ -109,36 +117,20 @@ class ReplicationPostRegisterActionsServlet(ReplicationEndpoint):
                 registered user.
             access_token (str|None): The access token of the newly logged in
                 device, or None if `inhibit_login` enabled.
-            bind_email (bool): Whether to bind the email with the identity
-                server
-            bind_msisdn (bool): Whether to bind the msisdn with the identity
-                server
         """
-        return {
-            "auth_result": auth_result,
-            "access_token": access_token,
-            "bind_email": bind_email,
-            "bind_msisdn": bind_msisdn,
-        }
+        return {"auth_result": auth_result, "access_token": access_token}
 
-    @defer.inlineCallbacks
-    def _handle_request(self, request, user_id):
+    async def _handle_request(self, request, user_id):
         content = parse_json_object_from_request(request)
 
         auth_result = content["auth_result"]
         access_token = content["access_token"]
-        bind_email = content["bind_email"]
-        bind_msisdn = content["bind_msisdn"]
 
-        yield self.registration_handler.post_registration_actions(
-            user_id=user_id,
-            auth_result=auth_result,
-            access_token=access_token,
-            bind_email=bind_email,
-            bind_msisdn=bind_msisdn,
+        await self.registration_handler.post_registration_actions(
+            user_id=user_id, auth_result=auth_result, access_token=access_token
         )
 
-        defer.returnValue((200, {}))
+        return 200, {}
 
 
 def register_servlets(hs, http_server):

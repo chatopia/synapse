@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import inspect
 import logging
 
 from twisted.internet import defer
 
+from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.metrics.background_process_metrics import run_as_background_process
-from synapse.util.logcontext import make_deferred_yieldable, run_in_background
 
 logger = logging.getLogger(__name__)
 
@@ -27,18 +27,14 @@ def user_left_room(distributor, user, room_id):
     distributor.fire("user_left_room", user=user, room_id=room_id)
 
 
-def user_joined_room(distributor, user, room_id):
-    distributor.fire("user_joined_room", user=user, room_id=room_id)
-
-
-class Distributor(object):
+class Distributor:
     """A central dispatch point for loosely-connected pieces of code to
     register, observe, and fire signals.
 
     Signals are named simply by strings.
 
     TODO(paul): It would be nice to give signals stronger object identities,
-      so we can attach metadata, docstrings, detect typoes, etc... But this
+      so we can attach metadata, docstrings, detect typos, etc... But this
       model will do for today.
     """
 
@@ -50,9 +46,7 @@ class Distributor(object):
         if name in self.signals:
             raise KeyError("%r already has a signal named %s" % (self, name))
 
-        self.signals[name] = Signal(
-            name,
-        )
+        self.signals[name] = Signal(name)
 
         if name in self.pre_registration:
             signal = self.signals[name]
@@ -77,14 +71,10 @@ class Distributor(object):
         if name not in self.signals:
             raise KeyError("%r does not have a signal named %s" % (self, name))
 
-        run_as_background_process(
-            name,
-            self.signals[name].fire,
-            *args, **kwargs
-        )
+        run_as_background_process(name, self.signals[name].fire, *args, **kwargs)
 
 
-class Signal(object):
+class Signal:
     """A Signal is a dispatch point that stores a list of callables as
     observers of it.
 
@@ -113,26 +103,22 @@ class Signal(object):
         Returns a Deferred that will complete when all the observers have
         completed."""
 
-        def do(observer):
-            def eb(failure):
+        async def do(observer):
+            try:
+                result = observer(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            except Exception as e:
                 logger.warning(
-                    "%s signal observer %s failed: %r",
-                    self.name, observer, failure,
-                    exc_info=(
-                        failure.type,
-                        failure.value,
-                        failure.getTracebackObject()))
+                    "%s signal observer %s failed: %r", self.name, observer, e,
+                )
 
-            return defer.maybeDeferred(observer, *args, **kwargs).addErrback(eb)
+        deferreds = [run_in_background(do, o) for o in self.observers]
 
-        deferreds = [
-            run_in_background(do, o)
-            for o in self.observers
-        ]
-
-        return make_deferred_yieldable(defer.gatherResults(
-            deferreds, consumeErrors=True,
-        ))
+        return make_deferred_yieldable(
+            defer.gatherResults(deferreds, consumeErrors=True)
+        )
 
     def __repr__(self):
         return "<Signal name=%r>" % (self.name,)

@@ -16,20 +16,15 @@
 import hmac
 import logging
 from hashlib import sha256
+from http import HTTPStatus
 from os import path
-
-from six.moves import http_client
 
 import jinja2
 from jinja2 import TemplateNotFound
 
-from twisted.internet import defer
-from twisted.web.resource import Resource
-from twisted.web.server import NOT_DONE_YET
-
 from synapse.api.errors import NotFoundError, StoreError, SynapseError
 from synapse.config import ConfigError
-from synapse.http.server import finish_request, wrap_html_request_handler
+from synapse.http.server import DirectServeHtmlResource, respond_with_html
 from synapse.http.servlet import parse_string
 from synapse.types import UserID
 
@@ -42,11 +37,12 @@ logger = logging.getLogger(__name__)
 if hasattr(hmac, "compare_digest"):
     compare_digest = hmac.compare_digest
 else:
+
     def compare_digest(a, b):
         return a == b
 
 
-class ConsentResource(Resource):
+class ConsentResource(DirectServeHtmlResource):
     """A twisted Resource to display a privacy policy and gather consent to it
 
     When accessed via GET, returns the privacy policy via a template.
@@ -80,12 +76,13 @@ class ConsentResource(Resource):
            For POST: required; gives the value to be recorded in the database
            against the user.
     """
+
     def __init__(self, hs):
         """
         Args:
             hs (synapse.server.HomeServer): homeserver
         """
-        Resource.__init__(self)
+        super().__init__()
 
         self.hs = hs
         self.store = hs.get_datastore()
@@ -98,37 +95,29 @@ class ConsentResource(Resource):
         if self._default_consent_version is None:
             raise ConfigError(
                 "Consent resource is enabled but user_consent section is "
-                "missing in config file.",
+                "missing in config file."
             )
 
         consent_template_directory = hs.config.user_consent_template_dir
 
         loader = jinja2.FileSystemLoader(consent_template_directory)
         self._jinja_env = jinja2.Environment(
-            loader=loader,
-            autoescape=jinja2.select_autoescape(['html', 'htm', 'xml']),
+            loader=loader, autoescape=jinja2.select_autoescape(["html", "htm", "xml"])
         )
 
         if hs.config.form_secret is None:
             raise ConfigError(
                 "Consent resource is enabled but form_secret is not set in "
-                "config file. It should be set to an arbitrary secret string.",
+                "config file. It should be set to an arbitrary secret string."
             )
 
         self._hmac_secret = hs.config.form_secret.encode("utf-8")
 
-    def render_GET(self, request):
-        self._async_render_GET(request)
-        return NOT_DONE_YET
-
-    @wrap_html_request_handler
-    @defer.inlineCallbacks
-    def _async_render_GET(self, request):
+    async def _async_render_GET(self, request):
         """
         Args:
             request (twisted.web.http.Request):
         """
-
         version = parse_string(request, "v", default=self._default_consent_version)
         username = parse_string(request, "u", required=False, default="")
         userhmac = None
@@ -139,12 +128,12 @@ class ConsentResource(Resource):
 
             self._check_hash(username, userhmac_bytes)
 
-            if username.startswith('@'):
+            if username.startswith("@"):
                 qualified_user_id = username
             else:
                 qualified_user_id = UserID(username, self.hs.hostname).to_string()
 
-            u = yield self.store.get_user_by_id(qualified_user_id)
+            u = await self.store.get_user_by_id(qualified_user_id)
             if u is None:
                 raise NotFoundError("Unknown user")
 
@@ -153,7 +142,8 @@ class ConsentResource(Resource):
 
         try:
             self._render_template(
-                request, "%s.html" % (version,),
+                request,
+                "%s.html" % (version,),
                 user=username,
                 userhmac=userhmac,
                 version=version,
@@ -163,13 +153,7 @@ class ConsentResource(Resource):
         except TemplateNotFound:
             raise NotFoundError("Unknown policy version")
 
-    def render_POST(self, request):
-        self._async_render_POST(request)
-        return NOT_DONE_YET
-
-    @wrap_html_request_handler
-    @defer.inlineCallbacks
-    def _async_render_POST(self, request):
+    async def _async_render_POST(self, request):
         """
         Args:
             request (twisted.web.http.Request):
@@ -180,18 +164,18 @@ class ConsentResource(Resource):
 
         self._check_hash(username, userhmac)
 
-        if username.startswith('@'):
+        if username.startswith("@"):
             qualified_user_id = username
         else:
             qualified_user_id = UserID(username, self.hs.hostname).to_string()
 
         try:
-            yield self.store.user_set_consent_version(qualified_user_id, version)
+            await self.store.user_set_consent_version(qualified_user_id, version)
         except StoreError as e:
             if e.code != 404:
                 raise
             raise NotFoundError("Unknown user")
-        yield self.registration_handler.post_consent_actions(qualified_user_id)
+        await self.registration_handler.post_consent_actions(qualified_user_id)
 
         try:
             self._render_template(request, "success.html")
@@ -204,12 +188,8 @@ class ConsentResource(Resource):
         template_html = self._jinja_env.get_template(
             path.join(TEMPLATE_LANGUAGE, template_name)
         )
-        html_bytes = template_html.render(**template_args).encode("utf8")
-
-        request.setHeader(b"Content-Type", b"text/html; charset=utf-8")
-        request.setHeader(b"Content-Length", b"%i" % len(html_bytes))
-        request.write(html_bytes)
-        finish_request(request)
+        html = template_html.render(**template_args)
+        respond_with_html(request, 200, html)
 
     def _check_hash(self, userid, userhmac):
         """
@@ -221,11 +201,13 @@ class ConsentResource(Resource):
               SynapseError if the hash doesn't match
 
         """
-        want_mac = hmac.new(
-            key=self._hmac_secret,
-            msg=userid.encode('utf-8'),
-            digestmod=sha256,
-        ).hexdigest().encode('ascii')
+        want_mac = (
+            hmac.new(
+                key=self._hmac_secret, msg=userid.encode("utf-8"), digestmod=sha256
+            )
+            .hexdigest()
+            .encode("ascii")
+        )
 
         if not compare_digest(want_mac, userhmac):
-            raise SynapseError(http_client.FORBIDDEN, "HMAC incorrect")
+            raise SynapseError(HTTPStatus.FORBIDDEN, "HMAC incorrect")

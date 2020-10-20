@@ -16,7 +16,7 @@
 
 """Tests REST events for /rooms paths."""
 
-from mock import Mock, NonCallableMock
+from mock import Mock
 
 from twisted.internet import defer
 
@@ -39,20 +39,14 @@ class RoomTypingTestCase(unittest.HomeserverTestCase):
     def make_homeserver(self, reactor, clock):
 
         hs = self.setup_test_homeserver(
-            "red",
-            http_client=None,
-            federation_client=Mock(),
-            ratelimiter=NonCallableMock(spec_set=["send_message"]),
+            "red", http_client=None, federation_client=Mock(),
         )
 
         self.event_source = hs.get_event_sources().sources["typing"]
 
-        self.ratelimiter = hs.get_ratelimiter()
-        self.ratelimiter.send_message.return_value = (True, 0)
+        hs.get_federation_handler = Mock()
 
-        hs.get_handlers().federation_handler = Mock()
-
-        def get_user_by_access_token(token=None, allow_guest=False):
+        async def get_user_by_access_token(token=None, allow_guest=False):
             return {
                 "user": UserID.from_string(self.auth_user_id),
                 "token_id": 1,
@@ -61,8 +55,8 @@ class RoomTypingTestCase(unittest.HomeserverTestCase):
 
         hs.get_auth().get_user_by_access_token = get_user_by_access_token
 
-        def _insert_client_ip(*args, **kwargs):
-            return defer.succeed(None)
+        async def _insert_client_ip(*args, **kwargs):
+            return None
 
         hs.get_datastore().insert_client_ip = _insert_client_ip
 
@@ -109,7 +103,9 @@ class RoomTypingTestCase(unittest.HomeserverTestCase):
         self.assertEquals(200, channel.code)
 
         self.assertEquals(self.event_source.get_current_key(), 1)
-        events = self.event_source.get_new_events(from_key=0, room_ids=[self.room_id])
+        events = self.get_success(
+            self.event_source.get_new_events(from_key=0, room_ids=[self.room_id])
+        )
         self.assertEquals(
             events[0],
             [

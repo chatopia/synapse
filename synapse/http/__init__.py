@@ -16,8 +16,6 @@
 import re
 
 from twisted.internet import task
-from twisted.internet.defer import CancelledError
-from twisted.python import failure
 from twisted.web.client import FileBodyProducer
 
 from synapse.api.errors import SynapseError
@@ -25,30 +23,19 @@ from synapse.api.errors import SynapseError
 
 class RequestTimedOutError(SynapseError):
     """Exception representing timeout of an outbound request"""
-    def __init__(self):
-        super(RequestTimedOutError, self).__init__(504, "Timed out")
+
+    def __init__(self, msg):
+        super().__init__(504, msg)
 
 
-def cancelled_to_request_timed_out_error(value, timeout):
-    """Turns CancelledErrors into RequestTimedOutErrors.
-
-    For use with async.add_timeout_to_deferred
-    """
-    if isinstance(value, failure.Failure):
-        value.trap(CancelledError)
-        raise RequestTimedOutError()
-    return value
-
-
-ACCESS_TOKEN_RE = re.compile(r'(\?.*access(_|%5[Ff])token=)[^&]*(.*)$')
+ACCESS_TOKEN_RE = re.compile(r"(\?.*access(_|%5[Ff])token=)[^&]*(.*)$")
+CLIENT_SECRET_RE = re.compile(r"(\?.*client(_|%5[Ff])secret=)[^&]*(.*)$")
 
 
 def redact_uri(uri):
-    """Strips access tokens from the uri replaces with <redacted>"""
-    return ACCESS_TOKEN_RE.sub(
-        r'\1<redacted>\3',
-        uri
-    )
+    """Strips sensitive information from the uri replaces with <redacted>"""
+    uri = ACCESS_TOKEN_RE.sub(r"\1<redacted>\3", uri)
+    return CLIENT_SECRET_RE.sub(r"\1<redacted>\3", uri)
 
 
 class QuieterFileBodyProducer(FileBodyProducer):
@@ -57,6 +44,7 @@ class QuieterFileBodyProducer(FileBodyProducer):
     Workaround for https://github.com/matrix-org/synapse/issues/4003 /
     https://twistedmatrix.com/trac/ticket/6528
     """
+
     def stopProducing(self):
         try:
             FileBodyProducer.stopProducing(self)

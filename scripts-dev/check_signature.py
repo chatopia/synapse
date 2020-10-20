@@ -1,11 +1,10 @@
-
 import argparse
 import json
 import logging
 import sys
-import urllib2
 
 import dns.resolver
+import urllib2
 from signedjson.key import decode_verify_key_bytes, write_signing_keys
 from signedjson.sign import verify_signed_json
 from unpaddedbase64 import decode_base64
@@ -40,7 +39,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("signature_name")
     parser.add_argument(
-        "input_json", nargs="?", type=argparse.FileType('r'), default=sys.stdin
+        "input_json", nargs="?", type=argparse.FileType("r"), default=sys.stdin
     )
 
     args = parser.parse_args()
@@ -69,5 +68,5 @@ def main():
             print("FAIL %s" % (key_id,))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

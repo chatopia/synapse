@@ -16,8 +16,9 @@ from mock import Mock, patch
 
 from parameterized import parameterized
 
-from synapse.app.federation_reader import FederationReaderServer
+from synapse.app.generic_worker import GenericWorkerServer
 from synapse.app.homeserver import SynapseHomeServer
+from synapse.config.server import parse_listener_def
 
 from tests.unittest import HomeserverTestCase
 
@@ -25,16 +26,27 @@ from tests.unittest import HomeserverTestCase
 class FederationReaderOpenIDListenerTests(HomeserverTestCase):
     def make_homeserver(self, reactor, clock):
         hs = self.setup_test_homeserver(
-            http_client=None, homeserverToUse=FederationReaderServer,
+            http_client=None, homeserver_to_use=GenericWorkerServer
         )
         return hs
 
-    @parameterized.expand([
-        (["federation"], "auth_fail"),
-        ([], "no_resource"),
-        (["openid", "federation"], "auth_fail"),
-        (["openid"], "auth_fail"),
-    ])
+    def default_config(self):
+        conf = super().default_config()
+        # we're using FederationReaderServer, which uses a SlavedStore, so we
+        # have to tell the FederationHandler not to try to access stuff that is only
+        # in the primary store.
+        conf["worker_app"] = "yes"
+
+        return conf
+
+    @parameterized.expand(
+        [
+            (["federation"], "auth_fail"),
+            ([], "no_resource"),
+            (["openid", "federation"], "auth_fail"),
+            (["openid"], "auth_fail"),
+        ]
+    )
     def test_openid_listener(self, names, expectation):
         """
         Test different openid listener configurations.
@@ -43,27 +55,25 @@ class FederationReaderOpenIDListenerTests(HomeserverTestCase):
         """
         config = {
             "port": 8080,
+            "type": "http",
             "bind_addresses": ["0.0.0.0"],
             "resources": [{"names": names}],
         }
 
         # Listen with the config
-        self.hs._listen_http(config)
+        self.hs._listen_http(parse_listener_def(config))
 
         # Grab the resource from the site that was told to listen
         site = self.reactor.tcpServers[0][1]
         try:
-            self.resource = (
-                site.resource.children[b"_matrix"].children[b"federation"]
-            )
+            self.resource = site.resource.children[b"_matrix"].children[b"federation"]
         except KeyError:
             if expectation == "no_resource":
                 return
             raise
 
         request, channel = self.make_request(
-            "GET",
-            "/_matrix/federation/v1/openid/userinfo",
+            "GET", "/_matrix/federation/v1/openid/userinfo"
         )
         self.render(request)
 
@@ -74,16 +84,18 @@ class FederationReaderOpenIDListenerTests(HomeserverTestCase):
 class SynapseHomeserverOpenIDListenerTests(HomeserverTestCase):
     def make_homeserver(self, reactor, clock):
         hs = self.setup_test_homeserver(
-            http_client=None, homeserverToUse=SynapseHomeServer,
+            http_client=None, homeserver_to_use=SynapseHomeServer
         )
         return hs
 
-    @parameterized.expand([
-        (["federation"], "auth_fail"),
-        ([], "no_resource"),
-        (["openid", "federation"], "auth_fail"),
-        (["openid"], "auth_fail"),
-    ])
+    @parameterized.expand(
+        [
+            (["federation"], "auth_fail"),
+            ([], "no_resource"),
+            (["openid", "federation"], "auth_fail"),
+            (["openid"], "auth_fail"),
+        ]
+    )
     def test_openid_listener(self, names, expectation):
         """
         Test different openid listener configurations.
@@ -92,27 +104,25 @@ class SynapseHomeserverOpenIDListenerTests(HomeserverTestCase):
         """
         config = {
             "port": 8080,
+            "type": "http",
             "bind_addresses": ["0.0.0.0"],
             "resources": [{"names": names}],
         }
 
         # Listen with the config
-        self.hs._listener_http(config, config)
+        self.hs._listener_http(self.hs.get_config(), parse_listener_def(config))
 
         # Grab the resource from the site that was told to listen
         site = self.reactor.tcpServers[0][1]
         try:
-            self.resource = (
-                site.resource.children[b"_matrix"].children[b"federation"]
-            )
+            self.resource = site.resource.children[b"_matrix"].children[b"federation"]
         except KeyError:
             if expectation == "no_resource":
                 return
             raise
 
         request, channel = self.make_request(
-            "GET",
-            "/_matrix/federation/v1/openid/userinfo",
+            "GET", "/_matrix/federation/v1/openid/userinfo"
         )
         self.render(request)
 

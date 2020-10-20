@@ -15,10 +15,10 @@
 
 import logging
 
-from twisted.internet import defer
 from twisted.internet.error import AlreadyCalled, AlreadyCancelled
 
 from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.types import RoomStreamToken
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +32,13 @@ DELAY_BEFORE_MAIL_MS = 10 * 60 * 1000
 THROTTLE_START_MS = 10 * 60 * 1000
 THROTTLE_MAX_MS = 24 * 60 * 60 * 1000  # 24h
 # THROTTLE_MULTIPLIER = 6              # 10 mins, 1 hour, 6 hours, 24 hours
-THROTTLE_MULTIPLIER = 144              # 10 mins, 24 hours - i.e. jump straight to 1 day
+THROTTLE_MULTIPLIER = 144  # 10 mins, 24 hours - i.e. jump straight to 1 day
 
 # If no event triggers a notification for this long after the previous,
 # the throttle is released.
 # 12 hours - a gap of 12 hours in conversation is surely enough to merit a new
 # notification when things get going again...
-THROTTLE_RESET_AFTER_MS = (12 * 60 * 60 * 1000)
+THROTTLE_RESET_AFTER_MS = 12 * 60 * 60 * 1000
 
 # does each email include all unread notifs, or just the ones which have happened
 # since the last mail?
@@ -46,24 +46,25 @@ THROTTLE_RESET_AFTER_MS = (12 * 60 * 60 * 1000)
 INCLUDE_ALL_UNREAD_NOTIFS = False
 
 
-class EmailPusher(object):
+class EmailPusher:
     """
     A pusher that sends email notifications about events (approximately)
     when they happen.
     This shares quite a bit of code with httpusher: it would be good to
     factor out the common parts
     """
+
     def __init__(self, hs, pusherdict, mailer):
         self.hs = hs
         self.mailer = mailer
 
         self.store = self.hs.get_datastore()
         self.clock = self.hs.get_clock()
-        self.pusher_id = pusherdict['id']
-        self.user_id = pusherdict['user_name']
-        self.app_id = pusherdict['app_id']
-        self.email = pusherdict['pushkey']
-        self.last_stream_ordering = pusherdict['last_stream_ordering']
+        self.pusher_id = pusherdict["id"]
+        self.user_id = pusherdict["user_name"]
+        self.app_id = pusherdict["app_id"]
+        self.email = pusherdict["pushkey"]
+        self.last_stream_ordering = pusherdict["last_stream_ordering"]
         self.timed_call = None
         self.throttle_params = None
 
@@ -72,8 +73,15 @@ class EmailPusher(object):
 
         self._is_processing = False
 
-    def on_started(self):
-        if self.mailer is not None:
+    def on_started(self, should_check_for_notifs):
+        """Called when this pusher has been started.
+
+        Args:
+            should_check_for_notifs (bool): Whether we should immediately
+                check for push to send. Set to False only if it's known there
+                is nothing to send
+        """
+        if should_check_for_notifs and self.mailer is not None:
             self._start_processing()
 
     def on_stop(self):
@@ -84,9 +92,16 @@ class EmailPusher(object):
                 pass
             self.timed_call = None
 
-    def on_new_notifications(self, min_stream_ordering, max_stream_ordering):
+    def on_new_notifications(self, max_token: RoomStreamToken):
+        # We just use the minimum stream ordering and ignore the vector clock
+        # component. This is safe to do as long as we *always* ignore the vector
+        # clock components.
+        max_stream_ordering = max_token.stream
+
         if self.max_stream_ordering:
-            self.max_stream_ordering = max(max_stream_ordering, self.max_stream_ordering)
+            self.max_stream_ordering = max(
+                max_stream_ordering, self.max_stream_ordering
+            )
         else:
             self.max_stream_ordering = max_stream_ordering
         self._start_processing()
@@ -107,8 +122,22 @@ class EmailPusher(object):
 
         run_as_background_process("emailpush.process", self._process)
 
-    @defer.inlineCallbacks
-    def _process(self):
+    def _pause_processing(self):
+        """Used by tests to temporarily pause processing of events.
+
+        Asserts that its not currently processing.
+        """
+        assert not self._is_processing
+        self._is_processing = True
+
+    def _resume_processing(self):
+        """Used by tests to resume processing of events after pausing.
+        """
+        assert self._is_processing
+        self._is_processing = False
+        self._start_processing()
+
+    async def _process(self):
         # we should never get here if we are already processing
         assert not self._is_processing
 
@@ -117,7 +146,7 @@ class EmailPusher(object):
 
             if self.throttle_params is None:
                 # this is our first loop: load up the throttle params
-                self.throttle_params = yield self.store.get_throttle_params_by_room(
+                self.throttle_params = await self.store.get_throttle_params_by_room(
                     self.pusher_id
                 )
 
@@ -126,7 +155,7 @@ class EmailPusher(object):
             while True:
                 starting_max_ordering = self.max_stream_ordering
                 try:
-                    yield self._unsafe_process()
+                    await self._unsafe_process()
                 except Exception:
                     logger.exception("Exception processing notifs")
                 if self.max_stream_ordering == starting_max_ordering:
@@ -134,8 +163,7 @@ class EmailPusher(object):
         finally:
             self._is_processing = False
 
-    @defer.inlineCallbacks
-    def _unsafe_process(self):
+    async def _unsafe_process(self):
         """
         Main logic of the push loop without the wrapper function that sets
         up logging, measures and guards against multiple instances of it
@@ -143,23 +171,21 @@ class EmailPusher(object):
         """
         start = 0 if INCLUDE_ALL_UNREAD_NOTIFS else self.last_stream_ordering
         fn = self.store.get_unread_push_actions_for_user_in_range_for_email
-        unprocessed = yield fn(self.user_id, start, self.max_stream_ordering)
+        unprocessed = await fn(self.user_id, start, self.max_stream_ordering)
 
         soonest_due_at = None
 
         if not unprocessed:
-            yield self.save_last_stream_ordering_and_success(self.max_stream_ordering)
+            await self.save_last_stream_ordering_and_success(self.max_stream_ordering)
             return
 
         for push_action in unprocessed:
-            received_at = push_action['received_ts']
+            received_at = push_action["received_ts"]
             if received_at is None:
                 received_at = 0
             notif_ready_at = received_at + DELAY_BEFORE_MAIL_MS
 
-            room_ready_at = self.room_ready_to_notify_at(
-                push_action['room_id']
-            )
+            room_ready_at = self.room_ready_to_notify_at(push_action["room_id"])
 
             should_notify_at = max(notif_ready_at, room_ready_at)
 
@@ -170,25 +196,23 @@ class EmailPusher(object):
                 # to be delivered.
 
                 reason = {
-                    'room_id': push_action['room_id'],
-                    'now': self.clock.time_msec(),
-                    'received_at': received_at,
-                    'delay_before_mail_ms': DELAY_BEFORE_MAIL_MS,
-                    'last_sent_ts': self.get_room_last_sent_ts(push_action['room_id']),
-                    'throttle_ms': self.get_room_throttle_ms(push_action['room_id']),
+                    "room_id": push_action["room_id"],
+                    "now": self.clock.time_msec(),
+                    "received_at": received_at,
+                    "delay_before_mail_ms": DELAY_BEFORE_MAIL_MS,
+                    "last_sent_ts": self.get_room_last_sent_ts(push_action["room_id"]),
+                    "throttle_ms": self.get_room_throttle_ms(push_action["room_id"]),
                 }
 
-                yield self.send_notification(unprocessed, reason)
+                await self.send_notification(unprocessed, reason)
 
-                yield self.save_last_stream_ordering_and_success(max([
-                    ea['stream_ordering'] for ea in unprocessed
-                ]))
+                await self.save_last_stream_ordering_and_success(
+                    max(ea["stream_ordering"] for ea in unprocessed)
+                )
 
                 # we update the throttle on all the possible unprocessed push actions
                 for ea in unprocessed:
-                    yield self.sent_notif_update_throttle(
-                        ea['room_id'], ea
-                    )
+                    await self.sent_notif_update_throttle(ea["room_id"], ea)
                 break
             else:
                 if soonest_due_at is None or should_notify_at < soonest_due_at:
@@ -206,13 +230,23 @@ class EmailPusher(object):
                 self.seconds_until(soonest_due_at), self.on_timer
             )
 
-    @defer.inlineCallbacks
-    def save_last_stream_ordering_and_success(self, last_stream_ordering):
+    async def save_last_stream_ordering_and_success(self, last_stream_ordering):
+        if last_stream_ordering is None:
+            # This happens if we haven't yet processed anything
+            return
+
         self.last_stream_ordering = last_stream_ordering
-        yield self.store.update_pusher_last_stream_ordering_and_success(
-            self.app_id, self.email, self.user_id,
-            last_stream_ordering, self.clock.time_msec()
+        pusher_still_exists = await self.store.update_pusher_last_stream_ordering_and_success(
+            self.app_id,
+            self.email,
+            self.user_id,
+            last_stream_ordering,
+            self.clock.time_msec(),
         )
+        if not pusher_still_exists:
+            # The pusher has been deleted while we were processing, so
+            # lets just stop and return.
+            self.on_stop()
 
     def seconds_until(self, ts_msec):
         secs = (ts_msec - self.clock.time_msec()) / 1000
@@ -243,17 +277,16 @@ class EmailPusher(object):
         may_send_at = last_sent_ts + throttle_ms
         return may_send_at
 
-    @defer.inlineCallbacks
-    def sent_notif_update_throttle(self, room_id, notified_push_action):
+    async def sent_notif_update_throttle(self, room_id, notified_push_action):
         # We have sent a notification, so update the throttle accordingly.
         # If the event that triggered the notif happened more than
         # THROTTLE_RESET_AFTER_MS after the previous one that triggered a
         # notif, we release the throttle. Otherwise, the throttle is increased.
-        time_of_previous_notifs = yield self.store.get_time_of_last_push_action_before(
-            notified_push_action['stream_ordering']
+        time_of_previous_notifs = await self.store.get_time_of_last_push_action_before(
+            notified_push_action["stream_ordering"]
         )
 
-        time_of_this_notifs = notified_push_action['received_ts']
+        time_of_this_notifs = notified_push_action["received_ts"]
 
         if time_of_previous_notifs is not None and time_of_this_notifs is not None:
             gap = time_of_this_notifs - time_of_previous_notifs
@@ -272,21 +305,19 @@ class EmailPusher(object):
                 new_throttle_ms = THROTTLE_START_MS
             else:
                 new_throttle_ms = min(
-                    current_throttle_ms * THROTTLE_MULTIPLIER,
-                    THROTTLE_MAX_MS
+                    current_throttle_ms * THROTTLE_MULTIPLIER, THROTTLE_MAX_MS
                 )
         self.throttle_params[room_id] = {
             "last_sent_ts": self.clock.time_msec(),
-            "throttle_ms": new_throttle_ms
+            "throttle_ms": new_throttle_ms,
         }
-        yield self.store.set_throttle_params(
+        await self.store.set_throttle_params(
             self.pusher_id, room_id, self.throttle_params[room_id]
         )
 
-    @defer.inlineCallbacks
-    def send_notification(self, push_actions, reason):
+    async def send_notification(self, push_actions, reason):
         logger.info("Sending notif email for user %r", self.user_id)
 
-        yield self.mailer.send_notification_mail(
+        await self.mailer.send_notification_mail(
             self.app_id, self.user_id, self.email, push_actions, reason
         )

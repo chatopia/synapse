@@ -1,163 +1,38 @@
-version: 2
+version: 2.1
 jobs:
   dockerhubuploadrelease:
-    machine: true
+    docker:
+      - image: docker:git
     steps:
       - checkout
-      - run: docker build -f docker/Dockerfile --label gitsha1=${CIRCLE_SHA1} -t matrixdotorg/synapse:${CIRCLE_TAG}-py2 .
-      - run: docker build -f docker/Dockerfile --label gitsha1=${CIRCLE_SHA1} -t matrixdotorg/synapse:${CIRCLE_TAG} -t matrixdotorg/synapse:${CIRCLE_TAG}-py3 --build-arg PYTHON_VERSION=3.6 .
+      - setup_remote_docker
+      - docker_prepare
       - run: docker login --username $DOCKER_HUB_USERNAME --password $DOCKER_HUB_PASSWORD
-      - run: docker push matrixdotorg/synapse:${CIRCLE_TAG}
-      - run: docker push matrixdotorg/synapse:${CIRCLE_TAG}-py2
-      - run: docker push matrixdotorg/synapse:${CIRCLE_TAG}-py3
-  dockerhubuploadlatest:
-    machine: true
-    steps:
-      - checkout
-      - run: docker build -f docker/Dockerfile --label gitsha1=${CIRCLE_SHA1} -t matrixdotorg/synapse:latest-py2 .
-      - run: docker build -f docker/Dockerfile --label gitsha1=${CIRCLE_SHA1} -t matrixdotorg/synapse:latest -t matrixdotorg/synapse:latest-py3 --build-arg PYTHON_VERSION=3.6 .
-      - run: docker login --username $DOCKER_HUB_USERNAME --password $DOCKER_HUB_PASSWORD
-      - run: docker push matrixdotorg/synapse:latest
-      - run: docker push matrixdotorg/synapse:latest-py2
-      - run: docker push matrixdotorg/synapse:latest-py3
-  sytestpy2:
-    docker:
-      - image: matrixdotorg/sytest-synapsepy2
-    working_directory: /src
-    steps:
-      - checkout
-      - run: /synapse_sytest.sh
-      - store_artifacts:
-          path: /logs
-          destination: logs
-      - store_test_results:
-          path: /logs
-  sytestpy2postgres:
-    docker:
-      - image: matrixdotorg/sytest-synapsepy2
-    working_directory: /src
-    steps:
-      - checkout
-      - run: POSTGRES=1 /synapse_sytest.sh
-      - store_artifacts:
-          path: /logs
-          destination: logs
-      - store_test_results:
-          path: /logs
-  sytestpy2merged:
-    docker:
-      - image: matrixdotorg/sytest-synapsepy2
-    working_directory: /src
-    steps:
-      - checkout
-      - run: bash .circleci/merge_base_branch.sh
-      - run: /synapse_sytest.sh
-      - store_artifacts:
-          path: /logs
-          destination: logs
-      - store_test_results:
-          path: /logs
-  sytestpy2postgresmerged:
-    docker:
-      - image: matrixdotorg/sytest-synapsepy2
-    working_directory: /src
-    steps:
-      - checkout
-      - run: bash .circleci/merge_base_branch.sh
-      - run: POSTGRES=1 /synapse_sytest.sh
-      - store_artifacts:
-          path: /logs
-          destination: logs
-      - store_test_results:
-          path: /logs
+      - docker_build:
+          tag: -t matrixdotorg/synapse:${CIRCLE_TAG}
+          platforms: linux/amd64
+      - docker_build:
+          tag: -t matrixdotorg/synapse:${CIRCLE_TAG}
+          platforms: linux/amd64,linux/arm/v7,linux/arm64
 
-  sytestpy3:
+  dockerhubuploadlatest:
     docker:
-      - image: matrixdotorg/sytest-synapsepy3
-    working_directory: /src
+      - image: docker:git
     steps:
       - checkout
-      - run: /synapse_sytest.sh
-      - store_artifacts:
-          path: /logs
-          destination: logs
-      - store_test_results:
-          path: /logs
-  sytestpy3postgres:
-    docker:
-      - image: matrixdotorg/sytest-synapsepy3
-    working_directory: /src
-    steps:
-      - checkout
-      - run: POSTGRES=1 /synapse_sytest.sh
-      - store_artifacts:
-          path: /logs
-          destination: logs
-      - store_test_results:
-          path: /logs
-  sytestpy3merged:
-    docker:
-      - image: matrixdotorg/sytest-synapsepy3
-    working_directory: /src
-    steps:
-      - checkout
-      - run: bash .circleci/merge_base_branch.sh
-      - run: /synapse_sytest.sh
-      - store_artifacts:
-          path: /logs
-          destination: logs
-      - store_test_results:
-          path: /logs
-  sytestpy3postgresmerged:
-    docker:
-      - image: matrixdotorg/sytest-synapsepy3
-    working_directory: /src
-    steps:
-      - checkout
-      - run: bash .circleci/merge_base_branch.sh
-      - run: POSTGRES=1 /synapse_sytest.sh
-      - store_artifacts:
-          path: /logs
-          destination: logs
-      - store_test_results:
-          path: /logs
+      - setup_remote_docker
+      - docker_prepare
+      - run: docker login --username $DOCKER_HUB_USERNAME --password $DOCKER_HUB_PASSWORD
+      - docker_build:
+          tag: -t matrixdotorg/synapse:latest
+          platforms: linux/amd64
+      - docker_build:
+          tag: -t matrixdotorg/synapse:latest
+          platforms: linux/amd64,linux/arm/v7,linux/arm64
 
 workflows:
-  version: 2
   build:
     jobs:
-      - sytestpy2:
-          filters:
-            branches:
-              only: /develop|master|release-.*/
-      - sytestpy2postgres:
-          filters:
-            branches:
-              only: /develop|master|release-.*/
-      - sytestpy3:
-          filters:
-            branches:
-              only: /develop|master|release-.*/
-      - sytestpy3postgres:
-          filters:
-            branches:
-              only: /develop|master|release-.*/
-      - sytestpy2merged:
-          filters:
-            branches:
-              ignore: /develop|master|release-.*/
-      - sytestpy2postgresmerged:
-          filters:
-            branches:
-              ignore: /develop|master|release-.*/
-      - sytestpy3merged:
-          filters:
-            branches:
-              ignore: /develop|master|release-.*/
-      - sytestpy3postgresmerged:
-          filters:
-            branches:
-              ignore: /develop|master|release-.*/
       - dockerhubuploadrelease:
           filters:
             tags:
@@ -168,3 +43,33 @@ workflows:
           filters:
             branches:
               only: master
+
+commands:
+  docker_prepare:
+    description: Downloads the buildx cli plugin and enables multiarch images
+    parameters:
+      buildx_version:
+        type: string
+        default: "v0.4.1"
+    steps:
+      - run: apk add --no-cache curl
+      - run: mkdir -vp ~/.docker/cli-plugins/ ~/dockercache
+      - run: curl --silent -L "https://github.com/docker/buildx/releases/download/<< parameters.buildx_version >>/buildx-<< parameters.buildx_version >>.linux-amd64" > ~/.docker/cli-plugins/docker-buildx
+      - run: chmod a+x ~/.docker/cli-plugins/docker-buildx
+      # install qemu links in /proc/sys/fs/binfmt_misc on the docker instance running the circleci job
+      - run: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+      # create a context named `builder` for the builds
+      - run: docker context create builder
+      # create a buildx builder using the new context, and set it as the default
+      - run: docker buildx create builder --use
+
+  docker_build:
+    description: Builds and pushed images to dockerhub using buildx
+    parameters:
+      platforms:
+        type: string
+        default: linux/amd64
+      tag:
+        type: string
+    steps:
+      - run: docker buildx build -f docker/Dockerfile --push --platform << parameters.platforms >> --label gitsha1=${CIRCLE_SHA1} << parameters.tag >> --progress=plain .

@@ -15,32 +15,44 @@
 
 import functools
 import gc
+import itertools
 import logging
 import os
 import platform
 import threading
 import time
-
-import six
+from typing import Callable, Dict, Iterable, Optional, Tuple, Union
 
 import attr
 from prometheus_client import Counter, Gauge, Histogram
-from prometheus_client.core import REGISTRY, GaugeMetricFamily
+from prometheus_client.core import (
+    REGISTRY,
+    CounterMetricFamily,
+    GaugeHistogramMetricFamily,
+    GaugeMetricFamily,
+)
 
 from twisted.internet import reactor
 
+import synapse
+from synapse.metrics._exposition import (
+    MetricsResource,
+    generate_latest,
+    start_http_server,
+)
+from synapse.util.versionstring import get_version_string
+
 logger = logging.getLogger(__name__)
 
+METRICS_PREFIX = "/_synapse/metrics"
+
 running_on_pypy = platform.python_implementation() == "PyPy"
-all_metrics = []
-all_collectors = []
-all_gauges = {}
+all_gauges = {}  # type: Dict[str, Union[LaterGauge, InFlightGauge]]
 
 HAVE_PROC_SELF_STAT = os.path.exists("/proc/self/stat")
 
 
-class RegistryProxy(object):
-
+class RegistryProxy:
     @staticmethod
     def collect():
         for metric in REGISTRY.collect():
@@ -48,13 +60,15 @@ class RegistryProxy(object):
                 yield metric
 
 
-@attr.s(hash=True)
-class LaterGauge(object):
+@attr.s(slots=True, hash=True)
+class LaterGauge:
 
-    name = attr.ib()
-    desc = attr.ib()
-    labels = attr.ib(hash=False)
-    caller = attr.ib()
+    name = attr.ib(type=str)
+    desc = attr.ib(type=str)
+    labels = attr.ib(hash=False, type=Optional[Iterable[str]])
+    # callback: should either return a value (if there are no labels for this metric),
+    # or dict mapping from a label tuple to a value
+    caller = attr.ib(type=Callable[[], Union[Dict[Tuple[str, ...], float], float]])
 
     def collect(self):
 
@@ -63,15 +77,12 @@ class LaterGauge(object):
         try:
             calls = self.caller()
         except Exception:
-            logger.exception(
-                "Exception running callback for LaterGauge(%s)",
-                self.name,
-            )
+            logger.exception("Exception running callback for LaterGauge(%s)", self.name)
             yield g
             return
 
         if isinstance(calls, dict):
-            for k, v in six.iteritems(calls):
+            for k, v in calls.items():
                 g.add_metric(k, v)
         else:
             g.add_metric([], calls)
@@ -90,7 +101,7 @@ class LaterGauge(object):
         all_gauges[self.name] = self
 
 
-class InFlightGauge(object):
+class InFlightGauge:
     """Tracks number of things (e.g. requests, Measure blocks, etc) in flight
     at any given time.
 
@@ -116,13 +127,11 @@ class InFlightGauge(object):
         # Create a class which have the sub_metrics values as attributes, which
         # default to 0 on initialization. Used to pass to registered callbacks.
         self._metrics_class = attr.make_class(
-            "_MetricsEntry",
-            attrs={x: attr.ib(0) for x in sub_metrics},
-            slots=True,
+            "_MetricsEntry", attrs={x: attr.ib(0) for x in sub_metrics}, slots=True
         )
 
         # Counts number of in flight blocks for a given set of label values
-        self._registrations = {}
+        self._registrations = {}  # type: Dict
 
         # Protects access to _registrations
         self._lock = threading.Lock()
@@ -157,7 +166,9 @@ class InFlightGauge(object):
 
         Note: may be called by a separate thread.
         """
-        in_flight = GaugeMetricFamily(self.name + "_total", self.desc, labels=self.labels)
+        in_flight = GaugeMetricFamily(
+            self.name + "_total", self.desc, labels=self.labels
+        )
 
         metrics_by_key = {}
 
@@ -179,8 +190,10 @@ class InFlightGauge(object):
         yield in_flight
 
         for name in self.sub_metrics:
-            gauge = GaugeMetricFamily("_".join([self.name, name]), "", labels=self.labels)
-            for key, metrics in six.iteritems(metrics_by_key):
+            gauge = GaugeMetricFamily(
+                "_".join([self.name, name]), "", labels=self.labels
+            )
+            for key, metrics in metrics_by_key.items():
                 gauge.add_metric(key, getattr(metrics, name))
             yield gauge
 
@@ -193,17 +206,96 @@ class InFlightGauge(object):
         all_gauges[self.name] = self
 
 
+class GaugeBucketCollector:
+    """Like a Histogram, but the buckets are Gauges which are updated atomically.
+
+    The data is updated by calling `update_data` with an iterable of measurements.
+
+    We assume that the data is updated less frequently than it is reported to
+    Prometheus, and optimise for that case.
+    """
+
+    __slots__ = ("_name", "_documentation", "_bucket_bounds", "_metric")
+
+    def __init__(
+        self,
+        name: str,
+        documentation: str,
+        buckets: Iterable[float],
+        registry=REGISTRY,
+    ):
+        """
+        Args:
+            name: base name of metric to be exported to Prometheus. (a _bucket suffix
+               will be added.)
+            documentation: help text for the metric
+            buckets: The top bounds of the buckets to report
+            registry: metric registry to register with
+        """
+        self._name = name
+        self._documentation = documentation
+
+        # the tops of the buckets
+        self._bucket_bounds = [float(b) for b in buckets]
+        if self._bucket_bounds != sorted(self._bucket_bounds):
+            raise ValueError("Buckets not in sorted order")
+
+        if self._bucket_bounds[-1] != float("inf"):
+            self._bucket_bounds.append(float("inf"))
+
+        self._metric = self._values_to_metric([])
+        registry.register(self)
+
+    def collect(self):
+        yield self._metric
+
+    def update_data(self, values: Iterable[float]):
+        """Update the data to be reported by the metric
+
+        The existing data is cleared, and each measurement in the input is assigned
+        to the relevant bucket.
+        """
+        self._metric = self._values_to_metric(values)
+
+    def _values_to_metric(self, values: Iterable[float]) -> GaugeHistogramMetricFamily:
+        total = 0.0
+        bucket_values = [0 for _ in self._bucket_bounds]
+
+        for v in values:
+            # assign each value to a bucket
+            for i, bound in enumerate(self._bucket_bounds):
+                if v <= bound:
+                    bucket_values[i] += 1
+                    break
+
+            # ... and increment the sum
+            total += v
+
+        # now, aggregate the bucket values so that they count the number of entries in
+        # that bucket or below.
+        accumulated_values = itertools.accumulate(bucket_values)
+
+        return GaugeHistogramMetricFamily(
+            self._name,
+            self._documentation,
+            buckets=list(
+                zip((str(b) for b in self._bucket_bounds), accumulated_values)
+            ),
+            gsum_value=total,
+        )
+
+
 #
 # Detailed CPU metrics
 #
 
-class CPUMetrics(object):
 
+class CPUMetrics:
     def __init__(self):
         ticks_per_sec = 100
         try:
             # Try and get the system config
-            ticks_per_sec = os.sysconf('SC_CLK_TCK')
+            ticks_per_sec = os.sysconf("SC_CLK_TCK")
         except (ValueError, TypeError, AttributeError):
             pass
 
@@ -237,13 +329,28 @@ gc_time = Histogram(
     "python_gc_time",
     "Time taken to GC (sec)",
     ["gen"],
-    buckets=[0.0025, 0.005, 0.01, 0.025, 0.05, 0.10, 0.25, 0.50, 1.00, 2.50,
-             5.00, 7.50, 15.00, 30.00, 45.00, 60.00],
+    buckets=[
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.10,
+        0.25,
+        0.50,
+        1.00,
+        2.50,
+        5.00,
+        7.50,
+        15.00,
+        30.00,
+        45.00,
+        60.00,
+    ],
 )
 
 
-class GCCounts(object):
-
+class GCCounts:
     def collect(self):
         cm = GaugeMetricFamily("python_gc_counts", "GC object counts", labels=["gen"])
         for n, m in enumerate(gc.get_count()):
@@ -254,6 +361,78 @@ class GCCounts(object):
 
 if not running_on_pypy:
     REGISTRY.register(GCCounts())
+
+
+#
+# PyPy GC / memory metrics
+#
+
+
+class PyPyGCStats:
+    def collect(self):
+
+        # @stats is a pretty-printer object with __str__() returning a nice table,
+        # plus some fields that contain data from that table.
+        # unfortunately, fields are pretty-printed themselves (i. e. '4.5MB').
+        stats = gc.get_stats(memory_pressure=False)  # type: ignore
+        # @s contains same fields as @stats, but as actual integers.
+        s = stats._s  # type: ignore
+
+        # also note that field naming is completely braindead
+        # and only vaguely correlates with the pretty-printed table.
+        # >>>> gc.get_stats(False)
+        # Total memory consumed:
+        #     GC used:            8.7MB (peak: 39.0MB)        # s.total_gc_memory, s.peak_memory
+        #        in arenas:            3.0MB                  # s.total_arena_memory
+        #        rawmalloced:          1.7MB                  # s.total_rawmalloced_memory
+        #        nursery:              4.0MB                  # s.nursery_size
+        #     raw assembler used: 31.0kB                      # s.jit_backend_used
+        #     -----------------------------
+        #     Total:              8.8MB                       # stats.memory_used_sum
+        #
+        #     Total memory allocated:
+        #     GC allocated:            38.7MB (peak: 41.1MB)  # s.total_allocated_memory, s.peak_allocated_memory
+        #        in arenas:            30.9MB                 # s.peak_arena_memory
+        #        rawmalloced:          4.1MB                  # s.peak_rawmalloced_memory
+        #        nursery:              4.0MB                  # s.nursery_size
+        #     raw assembler allocated: 1.0MB                  # s.jit_backend_allocated
+        #     -----------------------------
+        #     Total:                   39.7MB                 # stats.memory_allocated_sum
+        #
+        #     Total time spent in GC:  0.073                  # s.total_gc_time
+
+        pypy_gc_time = CounterMetricFamily(
+            "pypy_gc_time_seconds_total", "Total time spent in PyPy GC", labels=[],
+        )
+        pypy_gc_time.add_metric([], s.total_gc_time / 1000)
+        yield pypy_gc_time
+
+        pypy_mem = GaugeMetricFamily(
+            "pypy_memory_bytes",
+            "Memory tracked by PyPy allocator",
+            labels=["state", "class", "kind"],
+        )
+        # memory used by JIT assembler
+        pypy_mem.add_metric(["used", "", "jit"], s.jit_backend_used)
+        pypy_mem.add_metric(["allocated", "", "jit"], s.jit_backend_allocated)
+        # memory used by GCed objects
+        pypy_mem.add_metric(["used", "", "arenas"], s.total_arena_memory)
+        pypy_mem.add_metric(["allocated", "", "arenas"], s.peak_arena_memory)
+        pypy_mem.add_metric(["used", "", "rawmalloced"], s.total_rawmalloced_memory)
+        pypy_mem.add_metric(["allocated", "", "rawmalloced"], s.peak_rawmalloced_memory)
+        pypy_mem.add_metric(["used", "", "nursery"], s.nursery_size)
+        pypy_mem.add_metric(["allocated", "", "nursery"], s.nursery_size)
+        # totals
+        pypy_mem.add_metric(["used", "totals", "gc"], s.total_gc_memory)
+        pypy_mem.add_metric(["allocated", "totals", "gc"], s.total_allocated_memory)
+        pypy_mem.add_metric(["used", "totals", "gc_peak"], s.peak_memory)
+        pypy_mem.add_metric(["allocated", "totals", "gc_peak"], s.peak_allocated_memory)
+        yield pypy_mem
+
+
+if running_on_pypy:
+    REGISTRY.register(PyPyGCStats())
+
 
 #
 # Twisted reactor metrics
@@ -279,9 +458,7 @@ sent_transactions_counter = Counter("synapse_federation_client_sent_transactions
 events_processed_counter = Counter("synapse_federation_client_events_processed", "")
 
 event_processing_loop_counter = Counter(
-    "synapse_event_processing_loop_count",
-    "Event processing loop iterations",
-    ["name"],
+    "synapse_event_processing_loop_count", "Event processing loop iterations", ["name"]
 )
 
 event_processing_loop_room_count = Counter(
@@ -307,11 +484,26 @@ event_processing_last_ts = Gauge("synapse_event_processing_last_ts", "", ["name"
 # finished being processed.
 event_processing_lag = Gauge("synapse_event_processing_lag", "", ["name"])
 
+event_processing_lag_by_event = Histogram(
+    "synapse_event_processing_lag_by_event",
+    "Time between an event being persisted and it being queued up to be sent to the relevant remote servers",
+    ["name"],
+)
+
+# Build info of the running server.
+build_info = Gauge(
+    "synapse_build_info", "Build information", ["pythonversion", "version", "osversion"]
+)
+build_info.labels(
+    " ".join([platform.python_implementation(), platform.python_version()]),
+    get_version_string(synapse),
+    " ".join([platform.system(), platform.release()]),
+).set(1)
+
 last_ticked = time.time()
 
 
-class ReactorLastSeenMetric(object):
-
+class ReactorLastSeenMetric:
     def collect(self):
         cm = GaugeMetricFamily(
             "python_twisted_reactor_last_seen",
@@ -325,7 +517,6 @@ REGISTRY.register(ReactorLastSeenMetric())
 
 
 def runUntilCurrentTimer(func):
-
     @functools.wraps(func)
     def f(*args, **kwargs):
         now = reactor.seconds()
@@ -369,7 +560,10 @@ def runUntilCurrentTimer(func):
         counts = gc.get_count()
         for i in (2, 1, 0):
             if threshold[i] < counts[i]:
-                logger.info("Collecting gc %d", i)
+                if i == 0:
+                    logger.debug("Collecting gc %d", i)
+                else:
+                    logger.info("Collecting gc %d", i)
 
                 start = time.time()
                 unreachable = gc.collect(i)
@@ -399,3 +593,12 @@ try:
         gc.disable()
 except AttributeError:
     pass
+
+__all__ = [
+    "MetricsResource",
+    "generate_latest",
+    "start_http_server",
+    "LaterGauge",
+    "InFlightGauge",
+    "BucketCollector",
+]

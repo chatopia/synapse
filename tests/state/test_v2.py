@@ -14,14 +14,16 @@
 # limitations under the License.
 
 import itertools
-
-from six.moves import zip
+from typing import List
 
 import attr
 
-from synapse.api.constants import EventTypes, JoinRules, Membership, RoomVersions
+from twisted.internet import defer
+
+from synapse.api.constants import EventTypes, JoinRules, Membership
+from synapse.api.room_versions import RoomVersions
 from synapse.event_auth import auth_types_for_event
-from synapse.events import FrozenEvent
+from synapse.events import make_event_from_dict
 from synapse.state.v2 import lexicographical_topological_sort, resolve_events_with_store
 from synapse.types import EventID
 
@@ -42,13 +44,19 @@ MEMBERSHIP_CONTENT_BAN = {"membership": Membership.BAN}
 ORIGIN_SERVER_TS = 0
 
 
-class FakeEvent(object):
+class FakeClock:
+    def sleep(self, msec):
+        return defer.succeed(None)
+
+
+class FakeEvent:
     """A fake event we use as a convenience.
 
     NOTE: Again as a convenience we use "node_ids" rather than event_ids to
     refer to events. The event_id has node_id as localpart and example.com
     as domain.
     """
+
     def __init__(self, id, sender, type, state_key, content):
         self.node_id = id
         self.event_id = EventID(id, "example.com").to_string()
@@ -56,6 +64,7 @@ class FakeEvent(object):
         self.type = type
         self.state_key = state_key
         self.content = content
+        self.room_id = ROOM_ID
 
     def to_event(self, auth_events, prev_events):
         """Given the auth_events and prev_events, convert to a Frozen Event
@@ -86,7 +95,7 @@ class FakeEvent(object):
         if self.state_key is not None:
             event_dict["state_key"] = self.state_key
 
-        return FrozenEvent(event_dict)
+        return make_event_from_dict(event_dict)
 
 
 # All graphs start with this set of events
@@ -141,24 +150,14 @@ INITIAL_EVENTS = [
         content=MEMBERSHIP_CONTENT_JOIN,
     ),
     FakeEvent(
-        id="START",
-        sender=ZARA,
-        type=EventTypes.Message,
-        state_key=None,
-        content={},
+        id="START", sender=ZARA, type=EventTypes.Message, state_key=None, content={}
     ),
     FakeEvent(
-        id="END",
-        sender=ZARA,
-        type=EventTypes.Message,
-        state_key=None,
-        content={},
+        id="END", sender=ZARA, type=EventTypes.Message, state_key=None, content={}
     ),
 ]
 
-INITIAL_EDGES = [
-    "START", "IMZ", "IMC", "IMB", "IJR", "IPOWER", "IMA", "CREATE",
-]
+INITIAL_EDGES = ["START", "IMZ", "IMC", "IMB", "IJR", "IPOWER", "IMA", "CREATE"]
 
 
 class StateTestCase(unittest.TestCase):
@@ -169,12 +168,7 @@ class StateTestCase(unittest.TestCase):
                 sender=ALICE,
                 type=EventTypes.PowerLevels,
                 state_key="",
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 50,
-                    }
-                },
+                content={"users": {ALICE: 100, BOB: 50}},
             ),
             FakeEvent(
                 id="MA",
@@ -194,20 +188,12 @@ class StateTestCase(unittest.TestCase):
                 id="PB",
                 sender=BOB,
                 type=EventTypes.PowerLevels,
-                state_key='',
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 50,
-                    },
-                },
+                state_key="",
+                content={"users": {ALICE: 100, BOB: 50}},
             ),
         ]
 
-        edges = [
-            ["END", "MB", "MA", "PA", "START"],
-            ["END", "PB", "PA"],
-        ]
+        edges = [["END", "MB", "MA", "PA", "START"], ["END", "PB", "PA"]]
 
         expected_state_ids = ["PA", "MA", "MB"]
 
@@ -231,10 +217,7 @@ class StateTestCase(unittest.TestCase):
             ),
         ]
 
-        edges = [
-            ["END", "JR", "START"],
-            ["END", "ME", "START"],
-        ]
+        edges = [["END", "JR", "START"], ["END", "ME", "START"]]
 
         expected_state_ids = ["JR"]
 
@@ -247,45 +230,25 @@ class StateTestCase(unittest.TestCase):
                 sender=ALICE,
                 type=EventTypes.PowerLevels,
                 state_key="",
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 50,
-                    }
-                },
+                content={"users": {ALICE: 100, BOB: 50}},
             ),
             FakeEvent(
                 id="PB",
                 sender=BOB,
                 type=EventTypes.PowerLevels,
-                state_key='',
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 50,
-                        CHARLIE: 50,
-                    },
-                },
+                state_key="",
+                content={"users": {ALICE: 100, BOB: 50, CHARLIE: 50}},
             ),
             FakeEvent(
                 id="PC",
                 sender=CHARLIE,
                 type=EventTypes.PowerLevels,
-                state_key='',
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 50,
-                        CHARLIE: 0,
-                    },
-                },
+                state_key="",
+                content={"users": {ALICE: 100, BOB: 50, CHARLIE: 0}},
             ),
         ]
 
-        edges = [
-            ["END", "PC", "PB", "PA", "START"],
-            ["END", "PA"],
-        ]
+        edges = [["END", "PC", "PB", "PA", "START"], ["END", "PA"]]
 
         expected_state_ids = ["PC"]
 
@@ -294,68 +257,38 @@ class StateTestCase(unittest.TestCase):
     def test_topic_basic(self):
         events = [
             FakeEvent(
-                id="T1",
-                sender=ALICE,
-                type=EventTypes.Topic,
-                state_key="",
-                content={},
+                id="T1", sender=ALICE, type=EventTypes.Topic, state_key="", content={}
             ),
             FakeEvent(
                 id="PA1",
                 sender=ALICE,
                 type=EventTypes.PowerLevels,
-                state_key='',
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 50,
-                    },
-                },
+                state_key="",
+                content={"users": {ALICE: 100, BOB: 50}},
             ),
             FakeEvent(
-                id="T2",
-                sender=ALICE,
-                type=EventTypes.Topic,
-                state_key="",
-                content={},
+                id="T2", sender=ALICE, type=EventTypes.Topic, state_key="", content={}
             ),
             FakeEvent(
                 id="PA2",
                 sender=ALICE,
                 type=EventTypes.PowerLevels,
-                state_key='',
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 0,
-                    },
-                },
+                state_key="",
+                content={"users": {ALICE: 100, BOB: 0}},
             ),
             FakeEvent(
                 id="PB",
                 sender=BOB,
                 type=EventTypes.PowerLevels,
-                state_key='',
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 50,
-                    },
-                },
+                state_key="",
+                content={"users": {ALICE: 100, BOB: 50}},
             ),
             FakeEvent(
-                id="T3",
-                sender=BOB,
-                type=EventTypes.Topic,
-                state_key="",
-                content={},
+                id="T3", sender=BOB, type=EventTypes.Topic, state_key="", content={}
             ),
         ]
 
-        edges = [
-            ["END", "PA2", "T2", "PA1", "T1", "START"],
-            ["END", "T3", "PB", "PA1"],
-        ]
+        edges = [["END", "PA2", "T2", "PA1", "T1", "START"], ["END", "T3", "PB", "PA1"]]
 
         expected_state_ids = ["PA2", "T2"]
 
@@ -364,30 +297,17 @@ class StateTestCase(unittest.TestCase):
     def test_topic_reset(self):
         events = [
             FakeEvent(
-                id="T1",
-                sender=ALICE,
-                type=EventTypes.Topic,
-                state_key="",
-                content={},
+                id="T1", sender=ALICE, type=EventTypes.Topic, state_key="", content={}
             ),
             FakeEvent(
                 id="PA",
                 sender=ALICE,
                 type=EventTypes.PowerLevels,
-                state_key='',
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 50,
-                    },
-                },
+                state_key="",
+                content={"users": {ALICE: 100, BOB: 50}},
             ),
             FakeEvent(
-                id="T2",
-                sender=BOB,
-                type=EventTypes.Topic,
-                state_key="",
-                content={},
+                id="T2", sender=BOB, type=EventTypes.Topic, state_key="", content={}
             ),
             FakeEvent(
                 id="MB",
@@ -398,10 +318,7 @@ class StateTestCase(unittest.TestCase):
             ),
         ]
 
-        edges = [
-            ["END", "MB", "T2", "PA", "T1", "START"],
-            ["END", "T1"],
-        ]
+        edges = [["END", "MB", "T2", "PA", "T1", "START"], ["END", "T1"]]
 
         expected_state_ids = ["T1", "MB", "PA"]
 
@@ -410,61 +327,34 @@ class StateTestCase(unittest.TestCase):
     def test_topic(self):
         events = [
             FakeEvent(
-                id="T1",
-                sender=ALICE,
-                type=EventTypes.Topic,
-                state_key="",
-                content={},
+                id="T1", sender=ALICE, type=EventTypes.Topic, state_key="", content={}
             ),
             FakeEvent(
                 id="PA1",
                 sender=ALICE,
                 type=EventTypes.PowerLevels,
-                state_key='',
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 50,
-                    },
-                },
+                state_key="",
+                content={"users": {ALICE: 100, BOB: 50}},
             ),
             FakeEvent(
-                id="T2",
-                sender=ALICE,
-                type=EventTypes.Topic,
-                state_key="",
-                content={},
+                id="T2", sender=ALICE, type=EventTypes.Topic, state_key="", content={}
             ),
             FakeEvent(
                 id="PA2",
                 sender=ALICE,
                 type=EventTypes.PowerLevels,
-                state_key='',
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 0,
-                    },
-                },
+                state_key="",
+                content={"users": {ALICE: 100, BOB: 0}},
             ),
             FakeEvent(
                 id="PB",
                 sender=BOB,
                 type=EventTypes.PowerLevels,
-                state_key='',
-                content={
-                    "users": {
-                        ALICE: 100,
-                        BOB: 50,
-                    },
-                },
+                state_key="",
+                content={"users": {ALICE: 100, BOB: 50}},
             ),
             FakeEvent(
-                id="T3",
-                sender=BOB,
-                type=EventTypes.Topic,
-                state_key="",
-                content={},
+                id="T3", sender=BOB, type=EventTypes.Topic, state_key="", content={}
             ),
             FakeEvent(
                 id="MZ1",
@@ -474,11 +364,7 @@ class StateTestCase(unittest.TestCase):
                 content={},
             ),
             FakeEvent(
-                id="T4",
-                sender=ALICE,
-                type=EventTypes.Topic,
-                state_key="",
-                content={},
+                id="T4", sender=ALICE, type=EventTypes.Topic, state_key="", content={}
             ),
         ]
 
@@ -539,13 +425,15 @@ class StateTestCase(unittest.TestCase):
                 state_before = dict(state_at_event[prev_events[0]])
             else:
                 state_d = resolve_events_with_store(
-                    RoomVersions.V2,
+                    FakeClock(),
+                    ROOM_ID,
+                    RoomVersions.V2.identifier,
                     [state_at_event[n] for n in prev_events],
                     event_map=event_map,
                     state_res_store=TestStateResolutionStore(event_map),
                 )
 
-                state_before = self.successResultOf(state_d)
+                state_before = self.successResultOf(defer.ensureDeferred(state_d))
 
             state_after = dict(state_before)
             if fake_event.state_key is not None:
@@ -586,13 +474,7 @@ class StateTestCase(unittest.TestCase):
 
 class LexicographicalTestCase(unittest.TestCase):
     def test_simple(self):
-        graph = {
-            "l": {"o"},
-            "m": {"n", "o"},
-            "n": {"o"},
-            "o": set(),
-            "p": {"o"},
-        }
+        graph = {"l": {"o"}, "m": {"n", "o"}, "n": {"o"}, "o": set(), "p": {"o"}}
 
         res = list(lexicographical_topological_sort(graph, key=lambda x: x))
 
@@ -679,20 +561,28 @@ class SimpleParamStateTestCase(unittest.TestCase):
 
         self.expected_combined_state = {
             (e.type, e.state_key): e.event_id
-            for e in [create_event, alice_member, join_rules, bob_member, charlie_member]
+            for e in [
+                create_event,
+                alice_member,
+                join_rules,
+                bob_member,
+                charlie_member,
+            ]
         }
 
     def test_event_map_none(self):
         # Test that we correctly handle passing `None` as the event_map
 
         state_d = resolve_events_with_store(
-            RoomVersions.V2,
+            FakeClock(),
+            ROOM_ID,
+            RoomVersions.V2.identifier,
             [self.state_at_bob, self.state_at_charlie],
             event_map=None,
             state_res_store=TestStateResolutionStore(self.event_map),
         )
 
-        state = self.successResultOf(state_d)
+        state = self.successResultOf(defer.ensureDeferred(state_d))
 
         self.assert_dict(self.expected_combined_state, state)
 
@@ -705,7 +595,7 @@ def pairwise(iterable):
 
 
 @attr.s
-class TestStateResolutionStore(object):
+class TestStateResolutionStore:
     event_map = attr.ib()
 
     def get_events(self, event_ids, allow_rejected=False):
@@ -719,13 +609,11 @@ class TestStateResolutionStore(object):
             Deferred[dict[str, FrozenEvent]]: Dict from event_id to event.
         """
 
-        return {
-            eid: self.event_map[eid]
-            for eid in event_ids
-            if eid in self.event_map
-        }
+        return defer.succeed(
+            {eid: self.event_map[eid] for eid in event_ids if eid in self.event_map}
+        )
 
-    def get_auth_chain(self, event_ids):
+    def _get_auth_chain(self, event_ids: List[str]) -> List[str]:
         """Gets the full auth chain for a set of events (including rejected
         events).
 
@@ -737,11 +625,10 @@ class TestStateResolutionStore(object):
                presence of rejected events
 
         Args:
-            event_ids (list): The event IDs of the events to fetch the auth
+            event_ids: The event IDs of the events to fetch the auth
                 chain for. Must be state events.
-
         Returns:
-            Deferred[list[str]]: List of event IDs of the auth chain.
+            List of event IDs of the auth chain.
         """
 
         # Simple DFS for auth chain
@@ -759,3 +646,9 @@ class TestStateResolutionStore(object):
                 stack.append(aid)
 
         return list(result)
+
+    def get_auth_chain_difference(self, auth_sets):
+        chains = [frozenset(self._get_auth_chain(a)) for a in auth_sets]
+
+        common = set(chains[0]).intersection(*chains[1:])
+        return defer.succeed(set(chains[0]).union(*chains[1:]) - common)

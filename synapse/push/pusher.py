@@ -15,44 +15,34 @@
 
 import logging
 
+from synapse.push.emailpusher import EmailPusher
+from synapse.push.mailer import Mailer
+
 from .httppusher import HttpPusher
 
 logger = logging.getLogger(__name__)
 
-# We try importing this if we can (it will fail if we don't
-# have the optional email dependencies installed). We don't
-# yet have the config to know if we need the email pusher,
-# but importing this after daemonizing seems to fail
-# (even though a simple test of importing from a daemonized
-# process works fine)
-try:
-    from synapse.push.emailpusher import EmailPusher
-    from synapse.push.mailer import Mailer, load_jinja2_templates
-except Exception:
-    pass
 
-
-class PusherFactory(object):
+class PusherFactory:
     def __init__(self, hs):
         self.hs = hs
+        self.config = hs.config
 
-        self.pusher_types = {
-            "http": HttpPusher,
-        }
+        self.pusher_types = {"http": HttpPusher}
 
         logger.info("email enable notifs: %r", hs.config.email_enable_notifs)
         if hs.config.email_enable_notifs:
             self.mailers = {}  # app_name -> Mailer
 
-            templates = load_jinja2_templates(hs.config)
-            self.notif_template_html, self.notif_template_text = templates
+            self._notif_template_html = hs.config.email_notif_template_html
+            self._notif_template_text = hs.config.email_notif_template_text
 
             self.pusher_types["email"] = self._create_email_pusher
 
             logger.info("defined email pusher type")
 
     def create_pusher(self, pusherdict):
-        kind = pusherdict['kind']
+        kind = pusherdict["kind"]
         f = self.pusher_types.get(kind, None)
         if not f:
             return None
@@ -66,16 +56,18 @@ class PusherFactory(object):
             mailer = Mailer(
                 hs=self.hs,
                 app_name=app_name,
-                notif_template_html=self.notif_template_html,
-                notif_template_text=self.notif_template_text,
+                template_html=self._notif_template_html,
+                template_text=self._notif_template_text,
             )
             self.mailers[app_name] = mailer
         return EmailPusher(self.hs, pusherdict, mailer)
 
     def _app_name_from_pusherdict(self, pusherdict):
-        if 'data' in pusherdict and 'brand' in pusherdict['data']:
-            app_name = pusherdict['data']['brand']
-        else:
-            app_name = self.hs.config.email_app_name
+        data = pusherdict["data"]
 
-        return app_name
+        if isinstance(data, dict):
+            brand = data.get("brand")
+            if isinstance(brand, str):
+                return brand
+
+        return self.config.email_app_name

@@ -20,86 +20,15 @@ from mock import Mock
 from twisted.internet import defer
 
 from synapse.util.async_helpers import ObservableDeferred
-from synapse.util.caches.descriptors import Cache, cached
+from synapse.util.caches.descriptors import cached
 
 from tests import unittest
 
 
-class CacheTestCase(unittest.TestCase):
-    def setUp(self):
-        self.cache = Cache("test")
-
-    def test_empty(self):
-        failed = False
-        try:
-            self.cache.get("foo")
-        except KeyError:
-            failed = True
-
-        self.assertTrue(failed)
-
-    def test_hit(self):
-        self.cache.prefill("foo", 123)
-
-        self.assertEquals(self.cache.get("foo"), 123)
-
-    def test_invalidate(self):
-        self.cache.prefill(("foo",), 123)
-        self.cache.invalidate(("foo",))
-
-        failed = False
-        try:
-            self.cache.get(("foo",))
-        except KeyError:
-            failed = True
-
-        self.assertTrue(failed)
-
-    def test_eviction(self):
-        cache = Cache("test", max_entries=2)
-
-        cache.prefill(1, "one")
-        cache.prefill(2, "two")
-        cache.prefill(3, "three")  # 1 will be evicted
-
-        failed = False
-        try:
-            cache.get(1)
-        except KeyError:
-            failed = True
-
-        self.assertTrue(failed)
-
-        cache.get(2)
-        cache.get(3)
-
-    def test_eviction_lru(self):
-        cache = Cache("test", max_entries=2)
-
-        cache.prefill(1, "one")
-        cache.prefill(2, "two")
-
-        # Now access 1 again, thus causing 2 to be least-recently used
-        cache.get(1)
-
-        cache.prefill(3, "three")
-
-        failed = False
-        try:
-            cache.get(2)
-        except KeyError:
-            failed = True
-
-        self.assertTrue(failed)
-
-        cache.get(1)
-        cache.get(3)
-
-
-class CacheDecoratorTestCase(unittest.TestCase):
+class CacheDecoratorTestCase(unittest.HomeserverTestCase):
     @defer.inlineCallbacks
     def test_passthrough(self):
-        class A(object):
+        class A:
             @cached()
             def func(self, key):
                 return key
@@ -113,7 +42,7 @@ class CacheDecoratorTestCase(unittest.TestCase):
     def test_hit(self):
         callcount = [0]
 
-        class A(object):
+        class A:
             @cached()
             def func(self, key):
                 callcount[0] += 1
@@ -131,7 +60,7 @@ class CacheDecoratorTestCase(unittest.TestCase):
     def test_invalidate(self):
         callcount = [0]
 
-        class A(object):
+        class A:
             @cached()
             def func(self, key):
                 callcount[0] += 1
@@ -149,7 +78,7 @@ class CacheDecoratorTestCase(unittest.TestCase):
         self.assertEquals(callcount[0], 2)
 
     def test_invalidate_missing(self):
-        class A(object):
+        class A:
             @cached()
             def func(self, key):
                 return key
@@ -160,7 +89,7 @@ class CacheDecoratorTestCase(unittest.TestCase):
     def test_max_entries(self):
         callcount = [0]
 
-        class A(object):
+        class A:
             @cached(max_entries=10)
             def func(self, key):
                 callcount[0] += 1
@@ -187,7 +116,7 @@ class CacheDecoratorTestCase(unittest.TestCase):
 
         d = defer.succeed(123)
 
-        class A(object):
+        class A:
             @cached()
             def func(self, key):
                 callcount[0] += 1
@@ -197,7 +126,7 @@ class CacheDecoratorTestCase(unittest.TestCase):
 
         a.func.prefill(("foo",), ObservableDeferred(d))
 
-        self.assertEquals(a.func("foo"), d.result)
+        self.assertEquals(a.func("foo").result, d.result)
         self.assertEquals(callcount[0], 0)
 
     @defer.inlineCallbacks
@@ -205,7 +134,7 @@ class CacheDecoratorTestCase(unittest.TestCase):
         callcount = [0]
         callcount2 = [0]
 
-        class A(object):
+        class A:
             @cached()
             def func(self, key):
                 callcount[0] += 1
@@ -238,8 +167,8 @@ class CacheDecoratorTestCase(unittest.TestCase):
         callcount = [0]
         callcount2 = [0]
 
-        class A(object):
-            @cached(max_entries=4)  # HACK: This makes it 2 due to cache factor
+        class A:
+            @cached(max_entries=2)
             def func(self, key):
                 callcount[0] += 1
                 return key
@@ -275,7 +204,7 @@ class CacheDecoratorTestCase(unittest.TestCase):
         callcount = [0]
         callcount2 = [0]
 
-        class A(object):
+        class A:
             @cached()
             def func(self, key):
                 callcount[0] += 1
@@ -323,7 +252,7 @@ class UpsertManyTests(unittest.HomeserverTestCase):
 
         self.table_name = "table_" + hs.get_secrets().token_hex(6)
         self.get_success(
-            self.storage.runInteraction(
+            self.storage.db_pool.runInteraction(
                 "create",
                 lambda x, *a: x.execute(*a),
                 "CREATE TABLE %s (id INTEGER, username TEXT, value TEXT)"
@@ -331,7 +260,7 @@ class UpsertManyTests(unittest.HomeserverTestCase):
             )
         )
         self.get_success(
-            self.storage.runInteraction(
+            self.storage.db_pool.runInteraction(
                 "index",
                 lambda x, *a: x.execute(*a),
                 "CREATE UNIQUE INDEX %sindex ON %s(id, username)"
@@ -354,9 +283,9 @@ class UpsertManyTests(unittest.HomeserverTestCase):
         value_values = [["hello"], ["there"]]
 
         self.get_success(
-            self.storage.runInteraction(
+            self.storage.db_pool.runInteraction(
                 "test",
-                self.storage._simple_upsert_many_txn,
+                self.storage.db_pool.simple_upsert_many_txn,
                 self.table_name,
                 key_names,
                 key_values,
@@ -367,13 +296,13 @@ class UpsertManyTests(unittest.HomeserverTestCase):
 
         # Check results are what we expect
         res = self.get_success(
-            self.storage._simple_select_list(
+            self.storage.db_pool.simple_select_list(
                 self.table_name, None, ["id, username, value"]
             )
         )
         self.assertEqual(
             set(self._dump_to_tuple(res)),
-            set([(1, "user1", "hello"), (2, "user2", "there")]),
+            {(1, "user1", "hello"), (2, "user2", "there")},
         )
 
         # Update only user2
@@ -381,9 +310,9 @@ class UpsertManyTests(unittest.HomeserverTestCase):
         value_values = [["bleb"]]
 
         self.get_success(
-            self.storage.runInteraction(
+            self.storage.db_pool.runInteraction(
                 "test",
-                self.storage._simple_upsert_many_txn,
+                self.storage.db_pool.simple_upsert_many_txn,
                 self.table_name,
                 key_names,
                 key_values,
@@ -394,11 +323,11 @@ class UpsertManyTests(unittest.HomeserverTestCase):
 
         # Check results are what we expect
         res = self.get_success(
-            self.storage._simple_select_list(
+            self.storage.db_pool.simple_select_list(
                 self.table_name, None, ["id, username, value"]
             )
         )
         self.assertEqual(
             set(self._dump_to_tuple(res)),
-            set([(1, "user1", "hello"), (2, "user2", "bleb")]),
+            {(1, "user1", "hello"), (2, "user2", "bleb")},
         )

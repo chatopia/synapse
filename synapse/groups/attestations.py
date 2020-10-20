@@ -37,15 +37,13 @@ An attestation is a signed blob of json that looks like:
 
 import logging
 import random
+from typing import Tuple
 
 from signedjson.sign import sign_json
 
-from twisted.internet import defer
-
-from synapse.api.errors import RequestSendFailed, SynapseError
+from synapse.api.errors import HttpResponseException, RequestSendFailed, SynapseError
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.types import get_domain_from_id
-from synapse.util.logcontext import run_in_background
 
 logger = logging.getLogger(__name__)
 
@@ -62,17 +60,19 @@ DEFAULT_ATTESTATION_JITTER = (0.9, 1.3)
 UPDATE_ATTESTATION_TIME_MS = 1 * 24 * 60 * 60 * 1000
 
 
-class GroupAttestationSigning(object):
+class GroupAttestationSigning:
     """Creates and verifies group attestations.
     """
+
     def __init__(self, hs):
         self.keyring = hs.get_keyring()
         self.clock = hs.get_clock()
         self.server_name = hs.hostname
-        self.signing_key = hs.config.signing_key[0]
+        self.signing_key = hs.signing_key
 
-    @defer.inlineCallbacks
-    def verify_attestation(self, attestation, group_id, user_id, server_name=None):
+    async def verify_attestation(
+        self, attestation, group_id, user_id, server_name=None
+    ):
         """Verifies that the given attestation matches the given parameters.
 
         An optional server_name can be supplied to explicitly set which server's
@@ -97,10 +97,13 @@ class GroupAttestationSigning(object):
 
         # TODO: We also want to check that *new* attestations that people give
         # us to store are valid for at least a little while.
-        if valid_until_ms < self.clock.time_msec():
+        now = self.clock.time_msec()
+        if valid_until_ms < now:
             raise SynapseError(400, "Attestation expired")
 
-        yield self.keyring.verify_json_for_server(server_name, attestation)
+        await self.keyring.verify_json_for_server(
+            server_name, attestation, now, "Group attestation"
+        )
 
     def create_attestation(self, group_id, user_id):
         """Create an attestation for the group_id and user_id with default
@@ -110,14 +113,18 @@ class GroupAttestationSigning(object):
         validity_period *= random.uniform(*DEFAULT_ATTESTATION_JITTER)
         valid_until_ms = int(self.clock.time_msec() + validity_period)
 
-        return sign_json({
-            "group_id": group_id,
-            "user_id": user_id,
-            "valid_until_ms": valid_until_ms,
-        }, self.server_name, self.signing_key)
+        return sign_json(
+            {
+                "group_id": group_id,
+                "user_id": user_id,
+                "valid_until_ms": valid_until_ms,
+            },
+            self.server_name,
+            self.signing_key,
+        )
 
 
-class GroupAttestionRenewer(object):
+class GroupAttestionRenewer:
     """Responsible for sending and receiving attestation updates.
     """
 
@@ -129,12 +136,12 @@ class GroupAttestionRenewer(object):
         self.is_mine_id = hs.is_mine_id
         self.attestations = hs.get_groups_attestation_signing()
 
-        self._renew_attestations_loop = self.clock.looping_call(
-            self._start_renew_attestations, 30 * 60 * 1000,
-        )
+        if not hs.config.worker_app:
+            self._renew_attestations_loop = self.clock.looping_call(
+                self._start_renew_attestations, 30 * 60 * 1000
+            )
 
-    @defer.inlineCallbacks
-    def on_renew_attestation(self, group_id, user_id, content):
+    async def on_renew_attestation(self, group_id, user_id, content):
         """When a remote updates an attestation
         """
         attestation = content["attestation"]
@@ -142,66 +149,60 @@ class GroupAttestionRenewer(object):
         if not self.is_mine_id(group_id) and not self.is_mine_id(user_id):
             raise SynapseError(400, "Neither user not group are on this server")
 
-        yield self.attestations.verify_attestation(
-            attestation,
-            user_id=user_id,
-            group_id=group_id,
+        await self.attestations.verify_attestation(
+            attestation, user_id=user_id, group_id=group_id
         )
 
-        yield self.store.update_remote_attestion(group_id, user_id, attestation)
+        await self.store.update_remote_attestion(group_id, user_id, attestation)
 
-        defer.returnValue({})
+        return {}
 
     def _start_renew_attestations(self):
         return run_as_background_process("renew_attestations", self._renew_attestations)
 
-    @defer.inlineCallbacks
-    def _renew_attestations(self):
+    async def _renew_attestations(self):
         """Called periodically to check if we need to update any of our attestations
         """
 
         now = self.clock.time_msec()
 
-        rows = yield self.store.get_attestations_need_renewals(
+        rows = await self.store.get_attestations_need_renewals(
             now + UPDATE_ATTESTATION_TIME_MS
         )
 
-        @defer.inlineCallbacks
-        def _renew_attestation(group_id, user_id):
+        async def _renew_attestation(group_user: Tuple[str, str]):
+            group_id, user_id = group_user
             try:
                 if not self.is_mine_id(group_id):
                     destination = get_domain_from_id(group_id)
                 elif not self.is_mine_id(user_id):
                     destination = get_domain_from_id(user_id)
                 else:
-                    logger.warn(
+                    logger.warning(
                         "Incorrectly trying to do attestations for user: %r in %r",
-                        user_id, group_id,
+                        user_id,
+                        group_id,
                     )
-                    yield self.store.remove_attestation_renewal(group_id, user_id)
+                    await self.store.remove_attestation_renewal(group_id, user_id)
                     return
 
                 attestation = self.attestations.create_attestation(group_id, user_id)
 
-                yield self.transport_client.renew_group_attestation(
-                    destination, group_id, user_id,
-                    content={"attestation": attestation},
+                await self.transport_client.renew_group_attestation(
+                    destination, group_id, user_id, content={"attestation": attestation}
                 )
 
-                yield self.store.update_attestation_renewal(
+                await self.store.update_attestation_renewal(
                     group_id, user_id, attestation
                 )
-            except RequestSendFailed as e:
+            except (RequestSendFailed, HttpResponseException) as e:
                 logger.warning(
-                    "Failed to renew attestation of %r in %r: %s",
-                    user_id, group_id, e,
+                    "Failed to renew attestation of %r in %r: %s", user_id, group_id, e
                 )
             except Exception:
-                logger.exception("Error renewing attestation of %r in %r",
-                                 user_id, group_id)
+                logger.exception(
+                    "Error renewing attestation of %r in %r", user_id, group_id
+                )
 
         for row in rows:
-            group_id = row["group_id"]
-            user_id = row["user_id"]
-
-            run_in_background(_renew_attestation, group_id, user_id)
+            await _renew_attestation((row["group_id"], row["user_id"]))
